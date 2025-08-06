@@ -1,0 +1,324 @@
+/*
+ * vnet_shape.c – Virtual NIC that emulates latency, jitter, loss & rate‑limit
+ *
+ * Built for educational/demo purposes.  Insert with:  sudo insmod vnet_shape.ko
+ * The module registers a virtual network interface ("vshape0") that loops back
+ * outbound packets after applying the shaping parameters.  It is safe to use
+ * because it never touches physical hardware – everything happens in RAM.
+ *
+ * Key learning points:
+ *   • net_device API (ndo_* ops)
+ *   • sk_buff (skb) life‑cycle & queueing
+ *   • High‑resolution timers (hrtimer) for latency simulation
+ *   • Random packet drop (loss) & jitter injection
+ *   • Token‑bucket algorithm for bandwidth control
+ *   • Netlink family for runtime configuration from userspace (optional)
+ *
+ * Copyright (c) 2025, Your‑Name‑Here  – MIT License
+ */
+
+#define pr_fmt(fmt) "vnet_shape: " fmt
+
+#include <linux/module.h>
+#include <linux/version.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+#include <linux/random.h>
+#include <linux/ktime.h>
+#include <linux/hrtimer.h>
+#include <linux/skbuff.h>
+#include <linux/spinlock.h>
+#include <linux/slab.h>
+#include <linux/list.h>
+#include <linux/rtnetlink.h>
+#include <linux/u64_stats_sync.h>
+
+#include "netlink.h"  /*  Netlink header */
+
+MODULE_AUTHOR("Your Name <you@example.com>");
+MODULE_DESCRIPTION("Virtual NIC with latency, jitter, loss, and rate‑limit shaping");
+MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0");
+
+/* ---------- Tunables (defaults) ---------- */
+unsigned int param_delay_ms = 50;   /* base latency */
+unsigned int param_jitter_ms = 5;   /* +/- jitter */
+unsigned int param_loss_ppm = 0;    /* drop in parts‑per‑million */
+unsigned int param_rate_kbps = 100000; /* bandwidth cap per interface */
+module_param(param_delay_ms, uint, 0644);
+MODULE_PARM_DESC(param_delay_ms, "Base latency in milliseconds");
+module_param(param_jitter_ms, uint, 0644);
+MODULE_PARM_DESC(param_jitter_ms, "Jitter range in milliseconds (+/- around delay)");
+module_param(param_loss_ppm, uint, 0644);
+MODULE_PARM_DESC(param_loss_ppm, "Packet loss probability in PPM (0‑1,000,000)");
+module_param(param_rate_kbps, uint, 0644);
+MODULE_PARM_DESC(param_rate_kbps, "Rate limit in kilobits per second (0 = unlimited)");
+
+/* ---------- Internal structures ---------- */
+struct vshape_priv {
+    struct net_device *dev;
+
+    /* Queue for packets waiting their latency timer */
+    struct list_head tx_queue; /* list of struct vshape_qitem */
+    spinlock_t queue_lock;
+
+    /* High‑resolution timer */
+    struct hrtimer tx_timer;
+
+    /* Token‑bucket state */
+    u64 rate_bytes_per_ns;      /* bytes allowed per nanosecond */
+    u64 bucket_capacity_bytes;  /* maximum burst capacity */
+    u64 bucket_tokens;          /* current tokens in bytes */
+    ktime_t last_bucket_update;
+
+    /* Stats */
+    u64 tx_packets;
+    u64 tx_dropped;
+    u64 rx_packets;
+    struct u64_stats_sync stats_sync;
+};
+
+struct vshape_qitem {
+    struct sk_buff *skb;
+    ktime_t release_time;
+    struct list_head list;
+};
+
+/* ---------- Helper: token bucket logic ---------- */
+static void vshape_bucket_update(struct vshape_priv *vp)
+{
+    ktime_t now = ktime_get();
+    s64 ns = ktime_to_ns(ktime_sub(now, vp->last_bucket_update));
+    if (ns <= 0)
+        return;
+
+    /* Add tokens proportional to elapsed time */
+    __u128 add = (__u128)vp->rate_bytes_per_ns * ns;
+    /* clamp to capacity */
+    if (add > vp->bucket_capacity_bytes)
+        add = vp->bucket_capacity_bytes;
+
+    vp->bucket_tokens = min((u64)(vp->bucket_tokens + add), vp->bucket_capacity_bytes);
+    vp->last_bucket_update = now;
+}
+
+static bool vshape_bucket_consume(struct vshape_priv *vp, size_t bytes)
+{
+    if (!vp->rate_bytes_per_ns)
+        return true; /* unlimited */
+
+    vshape_bucket_update(vp);
+    if (vp->bucket_tokens < bytes)
+        return false;
+
+    vp->bucket_tokens -= bytes;
+    return true;
+}
+
+/* ---------- Helper: decide if packet should be dropped ---------- */
+static bool vshape_should_drop(void)
+{
+    if (!param_loss_ppm)
+        return false;
+    /* random32 in kernel provides pseudo‑random 32‑bit */
+    return (prandom_u32_max(1000000) < param_loss_ppm);
+}
+
+/* ---------- Timer callback to dequeue packets ---------- */
+static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
+{
+    struct vshape_priv *vp = container_of(timer, struct vshape_priv, tx_timer);
+    struct vshape_qitem *qitem, *tmp;
+    ktime_t now = ktime_get();
+
+    spin_lock(&vp->queue_lock);
+    list_for_each_entry_safe(qitem, tmp, &vp->tx_queue, list) {
+        if (ktime_after(now, qitem->release_time)) {
+            if (vshape_bucket_consume(vp, qitem->skb->len)) {
+                list_del(&qitem->list);
+                spin_unlock(&vp->queue_lock);
+
+                /* Loop back to RX path */
+                qitem->skb->dev = vp->dev;
+                qitem->skb->protocol = eth_type_trans(qitem->skb, vp->dev);
+                netif_rx(qitem->skb);
+
+                spin_lock(&vp->queue_lock);
+                vp->rx_packets++;
+                kfree(qitem);
+            }
+        }
+    }
+
+    /* Decide when to fire next */
+    if (!list_empty(&vp->tx_queue)) {
+        hrtimer_forward(timer, now, ns_to_ktime(1e6)); /* fire again in 1ms */
+        spin_unlock(&vp->queue_lock);
+        return HRTIMER_RESTART;
+    }
+
+    spin_unlock(&vp->queue_lock);
+    return HRTIMER_NORESTART;
+}
+
+/* ---------- ndo_start_xmit ---------- */
+static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev)
+{
+    struct vshape_priv *vp = netdev_priv(dev);
+
+    /* Drop? */
+    if (vshape_should_drop()) {
+        vp->tx_dropped++;
+        dev_kfree_skb(skb);
+        return NETDEV_TX_OK;
+    }
+
+    /* Compute release time with delay+jitter */
+    s32 jitter = (param_jitter_ms) ? (s32)prandom_u32_max(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
+    ktime_t delay = ms_to_ktime(param_delay_ms + jitter);
+    ktime_t release_time = ktime_add(ktime_get(), delay);
+
+    /* Enqueue */
+    struct vshape_qitem *qitem = kmalloc(sizeof(*qitem), GFP_ATOMIC);
+    if (!qitem) {
+        dev_kfree_skb(skb);
+        return NETDEV_TX_OK;
+    }
+    qitem->skb = skb;
+    qitem->release_time = release_time;
+
+    spin_lock(&vp->queue_lock);
+    list_add_tail(&qitem->list, &vp->tx_queue);
+    vp->tx_packets++;
+    /* Arm timer if not active */
+    if (!hrtimer_is_queued(&vp->tx_timer))
+        hrtimer_start(&vp->tx_timer, delay, HRTIMER_MODE_REL);
+    spin_unlock(&vp->queue_lock);
+
+    return NETDEV_TX_OK;
+}
+
+/* ---------- ndo_open / ndo_stop ---------- */
+static int vshape_open(struct net_device *dev)
+{
+    netif_start_queue(dev);
+    return 0;
+}
+
+static int vshape_stop(struct net_device *dev)
+{
+    netif_stop_queue(dev);
+    return 0;
+}
+
+/* ---------- net_device stats ---------- */
+static void vshape_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
+{
+    struct vshape_priv *vp = netdev_priv(dev);
+    u64 t, d, r;
+
+    u64_stats_fetch_begin(&vp->stats_sync);
+    t = vp->tx_packets;
+    d = vp->tx_dropped;
+    r = vp->rx_packets;
+    u64_stats_fetch_retry(&vp->stats_sync, 0);
+
+    stats->tx_packets = t;
+    stats->tx_dropped = d;
+    stats->rx_packets = r;
+}
+
+/* ---------- Setup net_device ---------- */
+static const struct net_device_ops vshape_netdev_ops = {
+    .ndo_open        = vshape_open,
+    .ndo_stop        = vshape_stop,
+    .ndo_start_xmit  = vshape_start_xmit,
+    .ndo_get_stats64 = vshape_get_stats64,
+};
+
+static void vshape_setup(struct net_device *dev)
+{
+    ether_setup(dev);
+    dev->netdev_ops = &vshape_netdev_ops;
+    dev->flags |= IFF_NOARP;
+    dev->features |= NETIF_F_HW_CSUM;
+    dev->priv_flags |= IFF_TX_SKB_SHARING;
+
+    /* Random MAC */
+    eth_random_addr(dev->dev_addr);
+}
+
+/* ---------- Forward decls for Netlink ---------- */
+extern int vshape_nl_init(void);
+extern void vshape_nl_exit(void);
+
+/* ---------- Module init & exit ---------- */
+static struct net_device *vshape_dev;
+
+static int __init vshape_init(void)
+{
+    int err;
+
+    vshape_dev = alloc_netdev(sizeof(struct vshape_priv), "vshape%d", NET_NAME_UNKNOWN, vshape_setup);
+    if (!vshape_dev)
+        return -ENOMEM;
+
+    struct vshape_priv *vp = netdev_priv(vshape_dev);
+    vp->dev = vshape_dev;
+    INIT_LIST_HEAD(&vp->tx_queue);
+    spin_lock_init(&vp->queue_lock);
+    hrtimer_init(&vp->tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    vp->tx_timer.function = vshape_tx_timer_fn;
+
+    /* Rate limit setup */
+    if (param_rate_kbps) {
+        vp->rate_bytes_per_ns = (u64)param_rate_kbps * 1000 / 8;
+        do_div(vp->rate_bytes_per_ns, 1000000000ULL);
+        vp->bucket_capacity_bytes = vp->rate_bytes_per_ns * 1000000ULL;
+    } else {
+        vp->rate_bytes_per_ns = 0;
+    }
+    vp->bucket_tokens = vp->bucket_capacity_bytes;
+    vp->last_bucket_update = ktime_get();
+    u64_stats_init(&vp->stats_sync);
+
+    if ((err = register_netdev(vshape_dev))) {
+        pr_err("register_netdev failed: %d\n", err);
+        free_netdev(vshape_dev);
+        return err;
+    }
+
+    if ((err = vshape_nl_init())) {
+        pr_err("netlink init failed: %d\n", err);
+        unregister_netdev(vshape_dev);
+        free_netdev(vshape_dev);
+        return err;
+    }
+
+    pr_info("vshape0 created: delay=%u ms jitter=%u ms loss=%u ppm rate=%u kbps\n",
+            param_delay_ms, param_jitter_ms, param_loss_ppm, param_rate_kbps);
+    return 0;
+}
+
+static void __exit vshape_exit(void)
+{
+    struct vshape_priv *vp = netdev_priv(vshape_dev);
+
+    hrtimer_cancel(&vp->tx_timer);
+
+    struct vshape_qitem *qitem, *tmp;
+    spin_lock(&vp->queue_lock);
+    list_for_each_entry_safe(qitem, tmp, &vp->tx_queue, list) {
+        dev_kfree_skb(qitem->skb);
+        kfree(qitem);
+    }
+    spin_unlock(&vp->queue_lock);
+
+    vshape_nl_exit();  /* ✅ Netlink cleanup */
+    unregister_netdev(vshape_dev);
+    free_netdev(vshape_dev);
+    pr_info("vshape0 removed\n");
+}
+
+module_init(vshape_init);
+module_exit(vshape_exit);
