@@ -1,0 +1,82 @@
+vshape_ctl – Userspace Control Tool for vnet-shape Kernel Module
+=================================================================
+
+Overview
+--------
+`vshape_ctl` is a userspace command-line utility that communicates with the `vnet-shape` kernel module via Generic Netlink sockets.
+It allows you to configure network emulation parameters—such as latency, jitter, packet loss, and rate limit—on a virtual network device (e.g., vshape0).
+
+This tool is useful for developers and testers who need to simulate poor or varying network conditions to test the robustness of networked systems, distributed applications, or games.
+
+Usage
+-----
+    ./vshape_ctl set <param> <value>
+
+Parameters:
+    delay   - One-way delay in milliseconds (e.g., 50 for 50ms)
+    jitter  - Random variation in delay in milliseconds
+    loss    - Packet loss rate in parts per million (PPM)
+    rate    - Bandwidth cap in kilobits per second (kbps)
+
+Examples
+--------
+    # Set 50ms fixed delay
+    ./vshape_ctl set delay 50
+
+    # Set jitter of 10ms
+    ./vshape_ctl set jitter 10
+
+    # Simulate 0.1% packet loss (1000 ppm)
+    ./vshape_ctl set loss 1000
+
+    # Limit bandwidth to 2 Mbps (2000 kbps)
+    ./vshape_ctl set rate 2000
+
+Requirements
+------------
+- libnl-3-dev
+- libnl-genl-3-dev
+
+Make sure both libraries are installed:
+
+    sudo apt install libnl-3-dev libnl-genl-3-dev
+
+Building
+--------
+The userspace tool is built via the top-level Makefile:
+
+    make
+
+This will compile the tool into:
+    userspace/build/vshape_ctl
+
+Design and Implementation
+--------------------------
+- `vshape_ctl` uses the Generic Netlink API to send control messages to the kernel module.
+- A shared header file `netlink.h` defines the Netlink family name and attribute IDs.
+- The tool uses `libnl` to create and send a message with the appropriate attribute (`VSHAPE_ATTR_DELAY_MS`, etc.) and value.
+- Parameters are interpreted as unsigned integers and validated in the userspace before sending.
+
+Error Handling
+--------------
+The tool will print descriptive error messages if:
+- The Netlink socket cannot be created or connected
+- The kernel module is not loaded or not registered under the expected family name
+- An invalid parameter name is given
+
+Limitations
+-----------
+- The tool currently supports only `set` operations.
+- There is no feedback or `get` support to query current values from the kernel.
+- Only one parameter can be changed per invocation.
+
+Future Improvements
+-------------------
+- Add support for querying current shaping parameters (`get` command)
+- Allow setting multiple parameters at once
+- Add batch mode (read from config file)
+- Integrate with systemd or init scripts for persistent configuration
+
+License
+-------
+This tool is part of the vnet-shape project and is intended for testing use.
