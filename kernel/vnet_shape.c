@@ -93,7 +93,8 @@ static void vshape_bucket_update(struct vshape_priv *vp)
         return;
 
     /* Add tokens proportional to elapsed time */
-    __u128 add = (__u128)vp->rate_bytes_per_ns * ns;
+ //   __u128 add = (__u128)vp->rate_bytes_per_ns * ns;
+    u64 add = mul_u64_u64_div_u64(vp->rate_bytes_per_ns, ns, 1);
     /* clamp to capacity */
     if (add > vp->bucket_capacity_bytes)
         add = vp->bucket_capacity_bytes;
@@ -245,7 +246,7 @@ static void vshape_setup(struct net_device *dev)
     dev->priv_flags |= IFF_TX_SKB_SHARING;
 
     /* Random MAC */
-    eth_random_addr(dev->dev_addr);
+    eth_random_addr((u8 *)dev->dev_addr);
 }
 
 /* ---------- Forward decls for Netlink ---------- */

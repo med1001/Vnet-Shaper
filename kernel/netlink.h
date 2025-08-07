@@ -1,4 +1,4 @@
-// netlink.h
+// kernel/netlink.h
 #ifndef _VSHAPE_NETLINK_H_
 #define _VSHAPE_NETLINK_H_
 
