@@ -2,24 +2,28 @@
 
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
-USER_BIN := userspace/vshape_ctl
-KMOD := vnet_shape.ko
 
-obj-m := vnet_shape.o
-vnet_shape-objs := kernel/vnet_shape.o kernel/vshape_nl.o
+KERNEL_DIR := $(PWD)/kernel
+KBUILD_DIR := $(KERNEL_DIR)/build
 
-all: $(USER_BIN) $(KMOD)
+USER_SRC := $(PWD)/userspace
+USER_BIN := $(USER_SRC)/build/vshape_ctl
 
-$(KMOD):
+all: $(USER_BIN) $(KBUILD_DIR)/vnet_shape.ko
+
+$(KBUILD_DIR)/vnet_shape.ko: $(KERNEL_DIR)/vnet_shape.c $(KERNEL_DIR)/vshape_nl.c
 	@echo "[*] Building kernel module..."
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) M=$(KERNEL_DIR) modules
+	mkdir -p $(KBUILD_DIR)
+	cp $(KERNEL_DIR)/vnet_mod.ko $(KBUILD_DIR)/vnet_shape.ko
 
-$(USER_BIN): userspace/vshape_ctl.c kernel/netlink.h
+$(USER_BIN): $(USER_SRC)/vshape_ctl.c $(KERNEL_DIR)/netlink.h
 	@echo "[*] Building user-space CLI..."
-	gcc -Wall -O2 -I./kernel userspace/vshape_ctl.c -o $(USER_BIN) \
-		-I/usr/include/libnl3 -lnl-genl-3 -lnl-3
+	mkdir -p $(USER_SRC)/build
+	gcc -Wall -O2 -I$(KERNEL_DIR) $< -o $@ -I/usr/include/libnl3 -lnl-genl-3 -lnl-3
 
 clean:
 	@echo "[*] Cleaning up..."
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	$(RM) $(USER_BIN) $(KMOD)
+	$(MAKE) -C $(KDIR) M=$(KERNEL_DIR) clean
+	rm -rf $(KBUILD_DIR)
+	rm -rf $(USER_SRC)/build
