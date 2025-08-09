@@ -3,11 +3,14 @@
 #include <net/genetlink.h>
 #include "netlink.h"
 
-/* Ces symboles doivent exister dans vnet_shape.c */
+// These symbols exist in vnet_shape.c
 extern unsigned int param_delay_ms;
 extern unsigned int param_jitter_ms;
 extern unsigned int param_loss_ppm;
 extern unsigned int param_rate_kbps;
+
+// Declare update function from vnet_shape.c
+extern void vshape_update_rate_limit(void);  // <-- ADDED
 
 static struct genl_family vshape_family;
 
@@ -32,8 +35,10 @@ static int vshape_set_params(struct sk_buff *skb, struct genl_info *info)
     if (info->attrs[VSHAPE_ATTR_LOSS_PPM])
         param_loss_ppm = nla_get_u32(info->attrs[VSHAPE_ATTR_LOSS_PPM]);
 
-    if (info->attrs[VSHAPE_ATTR_RATE_KBPS])
+    if (info->attrs[VSHAPE_ATTR_RATE_KBPS]) {
         param_rate_kbps = nla_get_u32(info->attrs[VSHAPE_ATTR_RATE_KBPS]);
+        vshape_update_rate_limit();  // <-- APPLY THE RATE CHANGE IMMEDIATELY
+    }
 
     pr_info("Netlink: new params — delay=%u, jitter=%u, loss=%u, rate=%u\n",
             param_delay_ms, param_jitter_ms, param_loss_ppm, param_rate_kbps);
