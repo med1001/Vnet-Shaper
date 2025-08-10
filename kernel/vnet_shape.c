@@ -1,5 +1,5 @@
 /*
- * vnet_shape.c – Virtual NIC that emulates latency, jitter, loss & rate‑limit
+ * vnet_shape.c – Virtual NIC that emulates latency, jitter, loss & rate-limit
  */
 
 #define pr_fmt(fmt) "vnet_shape: " fmt
@@ -19,10 +19,9 @@
 #include <linux/u64_stats_sync.h>
 
 #include "netlink.h"
-//#include "vnet_shape.h"  // <-- add this
 
 MODULE_AUTHOR("Your Name <you@example.com>");
-MODULE_DESCRIPTION("Virtual NIC with latency, jitter, loss, and rate‑limit shaping");
+MODULE_DESCRIPTION("Virtual NIC with latency, jitter, loss, and rate-limit shaping");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("1.0");
 
@@ -36,7 +35,7 @@ MODULE_PARM_DESC(param_delay_ms, "Base latency in milliseconds");
 module_param(param_jitter_ms, uint, 0644);
 MODULE_PARM_DESC(param_jitter_ms, "Jitter range in milliseconds (+/- around delay)");
 module_param(param_loss_ppm, uint, 0644);
-MODULE_PARM_DESC(param_loss_ppm, "Packet loss probability in PPM (0‑1,000,000)");
+MODULE_PARM_DESC(param_loss_ppm, "Packet loss probability in PPM (0-1,000,000)");
 module_param(param_rate_kbps, uint, 0644);
 MODULE_PARM_DESC(param_rate_kbps, "Rate limit in kilobits per second (0 = unlimited)");
 
@@ -141,14 +140,33 @@ static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
 static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct vshape_priv *vp = netdev_priv(dev);
+    struct ethhdr *eth;
 
+    /* Drop if configured loss */
     if (vshape_should_drop()) {
         vp->tx_dropped++;
         dev_kfree_skb(skb);
         return NETDEV_TX_OK;
     }
 
-    s32 jitter = (param_jitter_ms) ? (s32)prandom_u32_max(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
+    /* Avoid sending frames with our own source MAC (bridge warning) */
+    if (skb_mac_header_was_set(skb) && skb_mac_header_len(skb) >= ETH_HLEN) {
+        eth = eth_hdr(skb);
+        if (ether_addr_equal(eth->h_source, dev->dev_addr)) {
+            struct sk_buff *nskb = skb_copy(skb, GFP_ATOMIC);
+            if (!nskb) {
+                dev_kfree_skb(skb);
+                return NETDEV_TX_OK;
+            }
+            dev_kfree_skb(skb);
+            skb = nskb;
+            eth = eth_hdr(skb);
+            eth->h_source[5] ^= 0x01; /* tweak last byte */
+        }
+    }
+
+    s32 jitter = (param_jitter_ms) ?
+        (s32)prandom_u32_max(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
     ktime_t delay = ms_to_ktime(param_delay_ms + jitter);
     ktime_t release_time = ktime_add(ktime_get(), delay);
 
@@ -200,6 +218,7 @@ static void vshape_get_stats64(struct net_device *dev, struct rtnl_link_stats64 
     stats->tx_dropped = d;
     stats->rx_packets = r;
 }
+
 static struct net_device *vshape_dev;
 
 /* ---------- Exposed: runtime rate limit update ---------- */
@@ -245,9 +264,9 @@ static void vshape_setup(struct net_device *dev)
     dev->features |= NETIF_F_HW_CSUM;
     dev->priv_flags |= IFF_TX_SKB_SHARING;
 
-//   /* Random MAC */
-//    eth_random_addr((u8 *)dev->dev_addr);
-    eth_hw_addr_set(dev, "\x02\x00\x00\x00\x00\x01");  // Locally admin unicast MAC
+    /* Locally administered unicast MAC, random last byte to avoid duplicates */
+    u8 mac[ETH_ALEN] = {0x02, 0x00, 0x00, 0x00, 0x00, (u8)(get_random_u32() & 0xFF)};
+    eth_hw_addr_set(dev, mac);
 }
 
 /* ---------- Netlink hooks ---------- */
@@ -255,8 +274,6 @@ extern int vshape_nl_init(void);
 extern void vshape_nl_exit(void);
 
 /* ---------- Init/Exit ---------- */
-
-
 static int __init vshape_init(void)
 {
     int err;
