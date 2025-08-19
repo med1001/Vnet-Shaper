@@ -1,29 +1,13 @@
-# Top-level Makefile for vnet-shape
+.PHONY: all kernel userspace clean
 
-KDIR := /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
+all: kernel userspace
 
-KERNEL_DIR := $(PWD)/kernel
-KBUILD_DIR := $(KERNEL_DIR)/build
+kernel:
+	$(MAKE) -C kernel
 
-USER_SRC := $(PWD)/userspace
-USER_BIN := $(USER_SRC)/build/vshape_ctl
-
-all: $(USER_BIN) $(KBUILD_DIR)/vnet_shape.ko
-
-$(KBUILD_DIR)/vnet_shape.ko: $(KERNEL_DIR)/vnet_shape.c $(KERNEL_DIR)/vshape_nl.c
-	@echo "[*] Building kernel module..."
-	$(MAKE) -C $(KDIR) M=$(KERNEL_DIR) modules
-	mkdir -p $(KBUILD_DIR)
-	cp $(KERNEL_DIR)/vnet_mod.ko $(KBUILD_DIR)/vnet_shape.ko
-
-$(USER_BIN): $(USER_SRC)/vshape_ctl.c $(KERNEL_DIR)/netlink.h
-	@echo "[*] Building user-space CLI..."
-	mkdir -p $(USER_SRC)/build
-	gcc -Wall -O2 -I$(KERNEL_DIR) $< -o $@ -I/usr/include/libnl3 -lnl-genl-3 -lnl-3
+userspace:
+	$(MAKE) -C userspace
 
 clean:
-	@echo "[*] Cleaning up..."
-	$(MAKE) -C $(KDIR) M=$(KERNEL_DIR) clean
-	rm -rf $(KBUILD_DIR)
-	rm -rf $(USER_SRC)/build
+	$(MAKE) -C kernel clean
+	$(MAKE) -C userspace clean

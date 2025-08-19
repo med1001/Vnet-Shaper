@@ -1,4 +1,3 @@
-// vshape_nl.c
 #include <linux/module.h>
 #include <net/genetlink.h>
 #include "netlink.h"
@@ -10,7 +9,7 @@ extern unsigned int param_loss_ppm;
 extern unsigned int param_rate_kbps;
 
 // Declare update function from vnet_shape.c
-extern void vshape_update_rate_limit(void);  // <-- ADDED
+extern void vshape_update_rate_limit(void);
 
 static struct genl_family vshape_family;
 
@@ -37,7 +36,7 @@ static int vshape_set_params(struct sk_buff *skb, struct genl_info *info)
 
     if (info->attrs[VSHAPE_ATTR_RATE_KBPS]) {
         param_rate_kbps = nla_get_u32(info->attrs[VSHAPE_ATTR_RATE_KBPS]);
-        vshape_update_rate_limit();  // <-- APPLY THE RATE CHANGE IMMEDIATELY
+        vshape_update_rate_limit();  // APPLY THE RATE CHANGE IMMEDIATELY
     }
 
     pr_info("Netlink: new params — delay=%u, jitter=%u, loss=%u, rate=%u\n",
@@ -74,7 +73,7 @@ int __init vshape_nl_init(void)
     return err;
 }
 
-void __exit vshape_nl_exit(void)
+void vshape_nl_exit(void)
 {
     genl_unregister_family(&vshape_family);
     pr_info("Netlink family unregistered\n");

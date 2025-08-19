@@ -1,4 +1,4 @@
-// userspace/vshape_ctl.c – Uses libnl to set shaping parameters via Generic Netlink
+/* Simple userspace tool using libnl to set shaping parameters via Generic Netlink */
 
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
@@ -70,7 +70,12 @@ static int set_param(const char *param, uint32_t value) {
         goto out;
     }
 
+    /* optionally wait for ack (depending on libnl behaviour) */
+    nlmsg_free(msg);
+    nl_socket_free(sock);
+
     printf("Updated %s to %u successfully.\n", param, value);
+    return 0;
 
 out:
     nlmsg_free(msg);
@@ -94,7 +99,7 @@ int main(int argc, char *argv[]) {
     }
 
     const char *param = argv[2];
-    uint32_t value = atoi(argv[3]);
+    uint32_t value = (uint32_t)atoi(argv[3]);
 
     return set_param(param, value);
 }
