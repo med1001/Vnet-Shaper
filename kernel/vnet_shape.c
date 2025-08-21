@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * vnet_shape.c – Virtual NIC that emulates latency, jitter, loss & rate-limit
- * Logging in hot paths is compiled out by default. Define VNET_SHAPE_DEBUG
- * at build time to include verbose/rate-limited debug messages.
+ * vnet_shape.c – Two-ended virtual NIC (veth-like) that emulates latency,
+ * jitter, loss & rate-limit between its ends.
+ *
+ * Each end is a normal Ethernet netdev. Frames TX'd on A are shaped and
+ * delivered to B (and vice-versa). This makes it trivial to test in netns.
+ *
+ * Define VNET_SHAPE_DEBUG at build time to enable verbose/rate-limited debug.
  */
 
 #define pr_fmt(fmt) "vnet_shape: " fmt
@@ -25,19 +30,20 @@
 #include "netlink.h"
 
 MODULE_AUTHOR("Your Name <you@example.com>");
-MODULE_DESCRIPTION("Virtual NIC with latency, jitter, loss, and rate-limit shaping");
+MODULE_DESCRIPTION("Two-ended virtual NIC with latency/jitter/loss/rate shaping");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("1.0");
+MODULE_VERSION("2.0");
 
 /* ---------- Tunables (defaults) ---------- */
 unsigned int param_delay_ms = 50;
 unsigned int param_jitter_ms = 5;
 unsigned int param_loss_ppm = 0;
 unsigned int param_rate_kbps = 100000;
-/* burst window in ms used to size the token bucket capacity (avoid huge 1s burst) */
-unsigned int param_burst_ms = 100;
-/* runtime debug flag - meaningful only if compiled with VNET_SHAPE_DEBUG */
-bool param_debug = false;
+unsigned int param_burst_ms = 100;      /* bucket capacity window (ms) */
+bool         param_debug = false;
+
+bool         param_passthrough = false; /* bypass shaping (deliver immediately) */
+unsigned int param_max_queue = 100000;  /* safety cap for queued packets */
 
 module_param(param_delay_ms, uint, 0644);
 MODULE_PARM_DESC(param_delay_ms, "Base latency in milliseconds");
@@ -50,13 +56,13 @@ MODULE_PARM_DESC(param_rate_kbps, "Rate limit in kilobits per second (0 = unlimi
 module_param(param_burst_ms, uint, 0644);
 MODULE_PARM_DESC(param_burst_ms, "Burst size in milliseconds for token bucket capacity");
 module_param(param_debug, bool, 0644);
-MODULE_PARM_DESC(param_debug, "Enable additional rate-limited debug prints (only if built with VNET_SHAPE_DEBUG)");
+MODULE_PARM_DESC(param_debug, "Enable additional rate-limited debug prints (if built with VNET_SHAPE_DEBUG)");
+module_param(param_passthrough, bool, 0644);
+MODULE_PARM_DESC(param_passthrough, "Bypass shaping and deliver immediately to peer");
+module_param(param_max_queue, uint, 0644);
+MODULE_PARM_DESC(param_max_queue, "Max number of packets to queue per end");
 
-/*
- * If VNET_SHAPE_DEBUG is defined at compile time, HOTLOG/PRDEBUG emit
- * (rate-limited) messages. Otherwise they compile to nothing and the
- * corresponding format strings do not end up in the .ko.
- */
+/* ---------- Logging helpers ---------- */
 #ifdef VNET_SHAPE_DEBUG
 #define HOTLOG(fmt, ...) \
     do { if (param_debug) pr_info_ratelimited(fmt, ##__VA_ARGS__); } while (0)
@@ -66,36 +72,47 @@ MODULE_PARM_DESC(param_debug, "Enable additional rate-limited debug prints (only
 #define PRDEBUG(fmt, ...) do { } while (0)
 #endif
 
-/* ---------- Internal structures ---------- */
-struct vshape_priv {
-    struct net_device *dev;
-    struct list_head tx_queue;
-    spinlock_t queue_lock;
-    struct hrtimer tx_timer;
-
-    /* Token bucket (ms granularity) */
-    u64 rate_bytes_per_ms;
-    u64 bucket_capacity_bytes;
-    u64 bucket_tokens;
-    ktime_t last_bucket_update;
-
-    /* queue length for diagnostics */
-    u32 queue_len;
-
-    /* statistics (protected with u64_stats_sync) */
-    u64 tx_packets;
-    u64 tx_dropped;
-    u64 rx_packets;
-    struct u64_stats_sync stats_sync;
-};
-
+/* ---------- Per-end private ---------- */
 struct vshape_qitem {
     struct sk_buff *skb;
     ktime_t release_time;
     struct list_head list;
 };
 
-/* ---------- Token bucket logic ---------- */
+struct vshape_priv {
+    struct net_device *dev;          /* this end */
+    struct net_device *peer;         /* other end (paired device) */
+
+    /* shaping queue for frames transmitted *from* this end *to* its peer */
+    struct list_head tx_queue;
+    spinlock_t queue_lock;
+    struct hrtimer tx_timer;
+    u32 queue_len;
+
+    /* token bucket (per end, ms granularity) */
+    u64 rate_bytes_per_ms;
+    u64 bucket_capacity_bytes;
+    u64 bucket_tokens;
+    ktime_t last_bucket_update;
+
+    /* statistics */
+    struct u64_stats_sync stats_sync;
+    u64 tx_packets;   /* packets accepted from this end (before shaping) */
+    u64 tx_dropped;   /* dropped by loss or queue full */
+    u64 rx_packets;   /* packets delivered to peer's stack */
+};
+
+/* Exactly one pair per module load */
+static struct net_device *vshapeA_dev;
+static struct net_device *vshapeB_dev;
+
+/* convenience helper */
+static inline struct vshape_priv *vshape_priv(struct net_device *dev)
+{
+    return (struct vshape_priv *)netdev_priv(dev);
+}
+
+/* ---------- Token bucket helpers ---------- */
 static void vshape_bucket_update(struct vshape_priv *vp)
 {
     ktime_t now = ktime_get();
@@ -103,232 +120,215 @@ static void vshape_bucket_update(struct vshape_priv *vp)
     if (ns <= 0)
         return;
 
-    /* convert to milliseconds elapsed */
-    u64 ms = ns / 1000000ULL;
-    if (ms == 0)
-        return;
+    /* convert ns -> ms; keep coarse granularity to reduce overhead */
+    {
+        u64 ms = ns / 1000000ULL;
+        u64 add;
 
-    /* add = rate_bytes_per_ms * ms */
-    u64 add = vp->rate_bytes_per_ms * ms;
+        if (!ms)
+            return;
 
-    if (add > vp->bucket_capacity_bytes)
-        add = vp->bucket_capacity_bytes;
+        add = vp->rate_bytes_per_ms * ms;
+        if (add > vp->bucket_capacity_bytes)
+            add = vp->bucket_capacity_bytes;
 
-    vp->bucket_tokens = min((u64)(vp->bucket_tokens + add), vp->bucket_capacity_bytes);
-    vp->last_bucket_update = now;
-
-    PRDEBUG("bucket_update: added=%llu ms=%llu tokens=%llu capacity=%llu\n",
-           (unsigned long long)add, (unsigned long long)ms,
-           (unsigned long long)vp->bucket_tokens,
-           (unsigned long long)vp->bucket_capacity_bytes);
+        vp->bucket_tokens = min(vp->bucket_tokens + add, vp->bucket_capacity_bytes);
+        vp->last_bucket_update = now;
+    }
 }
 
 static bool vshape_bucket_consume(struct vshape_priv *vp, size_t bytes)
 {
-    /* if rate_bytes_per_ms == 0 => unlimited */
     if (!vp->rate_bytes_per_ms)
-        return true;
+        return true; /* unlimited */
 
     vshape_bucket_update(vp);
-    if (vp->bucket_tokens < bytes) {
-        PRDEBUG("bucket_consume: insufficient tokens (%llu < %zu)\n",
-                (unsigned long long)vp->bucket_tokens, bytes);
+    if (vp->bucket_tokens < bytes)
         return false;
-    }
 
     vp->bucket_tokens -= bytes;
-    PRDEBUG("bucket_consume: consumed=%zu tokens_left=%llu\n",
-            bytes, (unsigned long long)vp->bucket_tokens);
     return true;
 }
 
-/* ---------- Packet drop logic ---------- */
+/* ---------- Loss ---------- */
 static bool vshape_should_drop(void)
 {
     if (!param_loss_ppm)
         return false;
-    /* prandom_u32_max returns in [0, max-1] */
-    u32 r = prandom_u32_max(1000000);
-    bool drop = (r < param_loss_ppm);
-    if (drop)
-        HOTLOG("should_drop: random=%u loss_ppm=%u -> DROP\n", r, param_loss_ppm);
-    return drop;
+    return prandom_u32_max(1000000) < param_loss_ppm;
 }
 
-/* ---------- Timer dequeue (safer loop) ---------- */
+/* ---------- timer: dequeue and deliver to peer ---------- */
 static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
 {
     struct vshape_priv *vp = container_of(timer, struct vshape_priv, tx_timer);
+    struct vshape_priv *peer_vp = vshape_priv(vp->peer);
     ktime_t now = ktime_get();
     int processed = 0;
+    bool has_items = false;
 
     while (1) {
-        struct vshape_qitem *qitem = NULL;
+        struct vshape_qitem *q = NULL;
 
         spin_lock(&vp->queue_lock);
         if (list_empty(&vp->tx_queue)) {
-            /* nothing queued */
             spin_unlock(&vp->queue_lock);
             break;
         }
 
-        /* peek first queued item */
-        qitem = list_first_entry(&vp->tx_queue, struct vshape_qitem, list);
-
-        /* if not yet time to release, leave for later */
-        if (ktime_after(qitem->release_time, now)) {
+        q = list_first_entry(&vp->tx_queue, struct vshape_qitem, list);
+        if (ktime_after(q->release_time, now)) {
             spin_unlock(&vp->queue_lock);
             break;
         }
 
-        /* if tokens available, remove and send; otherwise, keep and retry later */
-        if (vshape_bucket_consume(vp, qitem->skb->len)) {
-            list_del(&qitem->list);
-            if (vp->queue_len)
-                vp->queue_len--;
-            /* we will process this item outside the lock */
-            spin_unlock(&vp->queue_lock);
-
-            /* prepare for reception into stack */
-            qitem->skb->dev = vp->dev;
-            qitem->skb->protocol = eth_type_trans(qitem->skb, vp->dev);
-
-            PRDEBUG("tx_timer: re-injecting skb len=%u proto=0x%04x\n",
-                    qitem->skb->len, ntohs(qitem->skb->protocol));
-            netif_rx(qitem->skb);
-
-            /* update rx counter safely */
-            u64_stats_update_begin(&vp->stats_sync);
-            vp->rx_packets++;
-            u64_stats_update_end(&vp->stats_sync);
-
-            kfree(qitem);
-            processed++;
-            /* continue loop to try next queued item */
-        } else {
-            /* Not enough tokens: schedule retry later; small summary log if debug enabled */
-            HOTLOG("tx_timer: not enough tokens to send skb len=%u, will retry\n", qitem->skb->len);
+        if (!vshape_bucket_consume(vp, q->skb->len)) {
             spin_unlock(&vp->queue_lock);
             break;
         }
+
+        list_del(&q->list);
+        if (vp->queue_len)
+            vp->queue_len--;
+        spin_unlock(&vp->queue_lock);
+
+        /* deliver to peer */
+        q->skb->dev = vp->peer;
+        q->skb->protocol = eth_type_trans(q->skb, vp->peer);
+        netif_rx(q->skb);
+
+        u64_stats_update_begin(&peer_vp->stats_sync);
+        peer_vp->rx_packets++;
+        u64_stats_update_end(&peer_vp->stats_sync);
+
+        kfree(q);
+        processed++;
     }
 
     if (processed)
-        pr_info_ratelimited("tx_timer: processed %d packets (queue_len now %u)\n",
-                            processed, vp->queue_len);
+        pr_info_ratelimited("%s: tx_timer delivered %d packets (queue_len now %u)\n",
+                            vp->dev->name, processed, vp->queue_len);
 
-    /* if queue still has items, schedule next tick in 1ms */
     spin_lock(&vp->queue_lock);
-    bool has_items = !list_empty(&vp->tx_queue);
+    has_items = !list_empty(&vp->tx_queue);
     spin_unlock(&vp->queue_lock);
 
     if (has_items) {
-        /* schedule next tick in 1ms relative to now */
-        hrtimer_forward_now(timer, ms_to_ktime(1));
+        hrtimer_forward_now(&vp->tx_timer, ms_to_ktime(1));
         return HRTIMER_RESTART;
     }
-
     return HRTIMER_NORESTART;
 }
 
-/* ---------- Packet transmit ---------- */
+/* ---------- transmit: enqueue towards peer ---------- */
 static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-    struct vshape_priv *vp = netdev_priv(dev);
+    struct vshape_priv *vp = vshape_priv(dev);
 
-    HOTLOG("start_xmit: called len=%u dev=%s\n", skb->len, dev->name);
+    if (unlikely(!vp->peer || !(vp->peer->flags & IFF_UP))) {
+        u64_stats_update_begin(&vp->stats_sync);
+        vp->tx_dropped++;
+        u64_stats_update_end(&vp->stats_sync);
+        dev_kfree_skb(skb);
+        return NETDEV_TX_OK;
+    }
 
-    /* Drop if configured loss */
+    /* pre-enqueue loss */
     if (vshape_should_drop()) {
         u64_stats_update_begin(&vp->stats_sync);
         vp->tx_dropped++;
         u64_stats_update_end(&vp->stats_sync);
-
-        HOTLOG("start_xmit: dropping packet due to loss policy (len=%u)\n", skb->len);
         dev_kfree_skb(skb);
         return NETDEV_TX_OK;
     }
 
-    /* Avoid sending frames with our own source MAC (bridge warning)
-     * If source MAC equals device MAC, copy and tweak last byte of source
-     * to avoid "received packet on dev with own address" bridge warnings.
-     *
-     * Use skb_copy(skb, GFP_ATOMIC) to ensure a private, writable copy.
-     */
-    if (skb_mac_header_was_set(skb) && skb_mac_header_len(skb) >= ETH_HLEN) {
-        struct ethhdr *eth = eth_hdr(skb);
-        if (ether_addr_equal(eth->h_source, dev->dev_addr)) {
-            HOTLOG("start_xmit: source MAC matches device MAC, copying skb and tweaking\n");
-            struct sk_buff *nskb = skb_copy(skb, GFP_ATOMIC);
-            if (!nskb) {
-                pr_warn("start_xmit: skb_copy failed, dropping\n");
-                dev_kfree_skb(skb);
-                return NETDEV_TX_OK;
-            }
-            /* free original and replace with copy */
-            dev_kfree_skb(skb);
-            skb = nskb;
-            eth = eth_hdr(skb);
-            eth->h_source[5] ^= 0x01; /* tweak last byte */
-            HOTLOG("start_xmit: tweaked source MAC -> %pM\n", eth->h_source);
-        }
-    }
+    /* passthrough: immediate delivery to peer */
+    if (param_passthrough) {
+        struct vshape_priv *peer_vp = vshape_priv(vp->peer);
 
-    /* compute jitter and release time */
-    s32 jitter = (param_jitter_ms) ? (s32)prandom_u32_max(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
-    ktime_t delay = ms_to_ktime(param_delay_ms + jitter);
-    ktime_t release_time = ktime_add(ktime_get(), delay);
+        u64_stats_update_begin(&vp->stats_sync);
+        vp->tx_packets++;
+        u64_stats_update_end(&vp->stats_sync);
 
-    struct vshape_qitem *qitem = kmalloc(sizeof(*qitem), GFP_ATOMIC);
-    if (!qitem) {
-        pr_warn("start_xmit: kmalloc failed, dropping skb\n");
-        dev_kfree_skb(skb);
+        skb->dev = vp->peer;
+        skb->protocol = eth_type_trans(skb, vp->peer);
+        netif_rx(skb);
+
+        u64_stats_update_begin(&peer_vp->stats_sync);
+        peer_vp->rx_packets++;
+        u64_stats_update_end(&peer_vp->stats_sync);
+
         return NETDEV_TX_OK;
     }
 
-    qitem->skb = skb;
-    qitem->release_time = release_time;
-
+    /* queue capacity check */
     spin_lock(&vp->queue_lock);
-    list_add_tail(&qitem->list, &vp->tx_queue);
-    vp->queue_len++;
-    /* update tx counter safely */
-    u64_stats_update_begin(&vp->stats_sync);
-    vp->tx_packets++;
-    u64_stats_update_end(&vp->stats_sync);
-
-    HOTLOG("start_xmit: enqueued skb len=%u release_ms=%lld total_queued=%u\n",
-           skb->len, (long long)ktime_to_ms(delay), vp->queue_len);
-
-    /* if timer not queued, start it to fire at 'delay' from now */
-    if (!hrtimer_is_queued(&vp->tx_timer)) {
-        HOTLOG("start_xmit: starting hrtimer for next release (delay_ms=%lld)\n",
-               (long long)ktime_to_ms(delay));
-        hrtimer_start(&vp->tx_timer, delay, HRTIMER_MODE_REL);
+    if (vp->queue_len >= param_max_queue) {
+        spin_unlock(&vp->queue_lock);
+        u64_stats_update_begin(&vp->stats_sync);
+        vp->tx_dropped++;
+        u64_stats_update_end(&vp->stats_sync);
+        pr_warn_ratelimited("%s: queue full (%u >= %u), dropping\n",
+                            dev->name, vp->queue_len, param_max_queue);
+        dev_kfree_skb(skb);
+        return NETDEV_TX_OK;
     }
     spin_unlock(&vp->queue_lock);
+
+    /* compute release time */
+    {
+        s32 jitter = param_jitter_ms ? (s32)prandom_u32_max(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
+        ktime_t delay = ms_to_ktime(param_delay_ms + jitter);
+        ktime_t release_time = ktime_add(ktime_get(), delay);
+        struct vshape_qitem *q = kmalloc(sizeof(*q), GFP_ATOMIC);
+
+        if (!q) {
+            u64_stats_update_begin(&vp->stats_sync);
+            vp->tx_dropped++;
+            u64_stats_update_end(&vp->stats_sync);
+            dev_kfree_skb(skb);
+            return NETDEV_TX_OK;
+        }
+
+        q->skb = skb;
+        q->release_time = release_time;
+
+        spin_lock(&vp->queue_lock);
+        list_add_tail(&q->list, &vp->tx_queue);
+        vp->queue_len++;
+        u64_stats_update_begin(&vp->stats_sync);
+        vp->tx_packets++;
+        u64_stats_update_end(&vp->stats_sync);
+
+        if (!hrtimer_is_queued(&vp->tx_timer))
+            hrtimer_start(&vp->tx_timer, delay, HRTIMER_MODE_REL);
+        spin_unlock(&vp->queue_lock);
+    }
 
     return NETDEV_TX_OK;
 }
 
-/* ---------- Net device ops ---------- */
+/* ---------- netdev ops ---------- */
 static int vshape_open(struct net_device *dev)
 {
-    pr_info("netdev_open: %s\n", dev->name);
+    struct vshape_priv *vp = vshape_priv(dev);
+    pr_info("%s: open (peer=%s)\n", dev->name, vp->peer ? vp->peer->name : "(none)");
     netif_start_queue(dev);
     return 0;
 }
 
 static int vshape_stop(struct net_device *dev)
 {
-    pr_info("netdev_stop: %s\n", dev->name);
+    struct vshape_priv *vp = vshape_priv(dev);
+    pr_info("%s: stop\n", dev->name);
     netif_stop_queue(dev);
+    hrtimer_cancel(&vp->tx_timer);
     return 0;
 }
 
 static void vshape_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 {
-    struct vshape_priv *vp = netdev_priv(dev);
+    struct vshape_priv *vp = vshape_priv(dev);
     unsigned int seq;
     u64 t, d, r;
 
@@ -342,53 +342,8 @@ static void vshape_get_stats64(struct net_device *dev, struct rtnl_link_stats64 
     stats->tx_packets = t;
     stats->tx_dropped = d;
     stats->rx_packets = r;
-
-    HOTLOG("get_stats64: tx=%llu tx_dropped=%llu rx=%llu\n",
-           (unsigned long long)t, (unsigned long long)d, (unsigned long long)r);
 }
 
-static struct net_device *vshape_dev;
-
-/* ---------- Exposed: runtime rate limit update ---------- */
-void vshape_update_rate_limit(void)
-{
-    if (!vshape_dev) {
-        pr_info("update_rate: no device present yet\n");
-        return;
-    }
-
-    struct vshape_priv *vp = netdev_priv(vshape_dev);
-    unsigned long flags;
-
-    spin_lock_irqsave(&vp->queue_lock, flags);
-
-    if (param_rate_kbps) {
-        /* bytes_per_sec = kbps * 1000 / 8 = kbps * 125 */
-        u64 bytes_per_sec = (u64)param_rate_kbps * 125ULL;
-        u64 bytes_per_ms = bytes_per_sec / 1000ULL;
-        if (bytes_per_ms == 0)
-            bytes_per_ms = 1;
-
-        vp->rate_bytes_per_ms = bytes_per_ms;
-        /* bucket capacity = burst_ms worth of tokens (configurable) */
-        vp->bucket_capacity_bytes = vp->rate_bytes_per_ms * (u64)param_burst_ms;
-    } else {
-        vp->rate_bytes_per_ms = 0;
-        vp->bucket_capacity_bytes = 0;
-    }
-
-    vp->bucket_tokens = vp->bucket_capacity_bytes;
-    vp->last_bucket_update = ktime_get();
-
-    spin_unlock_irqrestore(&vp->queue_lock, flags);
-
-    pr_info("Updated rate limiting: %u kbps burst=%u ms -> rate_bytes_per_ms=%llu capacity=%llu\n",
-            param_rate_kbps, param_burst_ms,
-            (unsigned long long)vp->rate_bytes_per_ms,
-            (unsigned long long)vp->bucket_capacity_bytes);
-}
-
-/* ---------- Device setup ---------- */
 static const struct net_device_ops vshape_netdev_ops = {
     .ndo_open        = vshape_open,
     .ndo_stop        = vshape_stop,
@@ -403,107 +358,191 @@ static void vshape_setup(struct net_device *dev)
     dev->features |= NETIF_F_HW_CSUM;
     dev->priv_flags |= IFF_TX_SKB_SHARING;
 
-    /* Locally administered unicast MAC, random last byte to avoid duplicates */
-    u8 mac[ETH_ALEN] = {0x02, 0x00, 0x00, 0x00, 0x00, (u8)(get_random_u32() & 0xFF)};
-    eth_hw_addr_set(dev, mac);
-
-    pr_info("vshape_setup: dev=%s mac=%pM\n", dev->name, dev->dev_addr);
+    /* local MAC */
+    {
+        u8 mac[ETH_ALEN] = {0x02, 0x00, 0x00, 0x00, 0x00, (u8)(get_random_u32() & 0xff)};
+        eth_hw_addr_set(dev, mac);
+    }
 }
 
-/* ---------- Netlink hooks ---------- */
+/* ---------- runtime update helper (netlink can call this) ---------- */
+void vshape_update_rate_limit(void)
+{
+    struct net_device *devs[2] = { vshapeA_dev, vshapeB_dev };
+    int i;
+    for (i = 0; i < 2; i++) {
+        struct vshape_priv *vp;
+        unsigned long flags;
+
+        if (!devs[i])
+            continue;
+
+        vp = vshape_priv(devs[i]);
+        spin_lock_irqsave(&vp->queue_lock, flags);
+
+        if (param_rate_kbps) {
+            u64 bytes_per_sec = (u64)param_rate_kbps * 125ULL;
+            u64 bytes_per_ms = bytes_per_sec / 1000ULL;
+            if (!bytes_per_ms) bytes_per_ms = 1;
+            vp->rate_bytes_per_ms = bytes_per_ms;
+            vp->bucket_capacity_bytes = vp->rate_bytes_per_ms * (u64)param_burst_ms;
+        } else {
+            vp->rate_bytes_per_ms = 0;
+            vp->bucket_capacity_bytes = 0;
+        }
+        vp->bucket_tokens = vp->bucket_capacity_bytes;
+        vp->last_bucket_update = ktime_get();
+
+        spin_unlock_irqrestore(&vp->queue_lock, flags);
+
+        pr_info("%s: rate=%u kbps burst=%u ms -> %llu B/ms cap=%llu\n",
+                devs[i]->name, param_rate_kbps, param_burst_ms,
+                (unsigned long long)vp->rate_bytes_per_ms,
+                (unsigned long long)vp->bucket_capacity_bytes);
+    }
+}
+EXPORT_SYMBOL_GPL(vshape_update_rate_limit); /* optional if used by netlink.c */
+
+/* ---------- netlink hooks (extern) ---------- */
 extern int vshape_nl_init(void);
 extern void vshape_nl_exit(void);
 
-/* ---------- Init/Exit ---------- */
-static int __init vshape_init(void)
+/* ---------- init helpers ---------- */
+static int vshape_init_one(struct net_device **pdev, const char *namepat)
 {
-    int err;
+    struct net_device *dev;
+    struct vshape_priv *vp;
 
-    vshape_dev = alloc_netdev(sizeof(struct vshape_priv), "vshape%d", NET_NAME_UNKNOWN, vshape_setup);
-    if (!vshape_dev)
+    dev = alloc_netdev(sizeof(struct vshape_priv), namepat, NET_NAME_UNKNOWN, vshape_setup);
+    if (!dev)
         return -ENOMEM;
 
-    struct vshape_priv *vp = netdev_priv(vshape_dev);
-    vp->dev = vshape_dev;
+    vp = vshape_priv(dev);
+    memset(vp, 0, sizeof(*vp));
+    vp->dev = dev;
+
     INIT_LIST_HEAD(&vp->tx_queue);
     spin_lock_init(&vp->queue_lock);
     hrtimer_init(&vp->tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     vp->tx_timer.function = vshape_tx_timer_fn;
 
-    vp->queue_len = 0;
-
-    /* Initialize token bucket using ms granularity */
     if (param_rate_kbps) {
-        /* bytes_per_sec = kbps * 1000 / 8 = kbps * 125 */
         u64 bytes_per_sec = (u64)param_rate_kbps * 125ULL;
-        u64 bytes_per_ms = bytes_per_sec / 1000ULL; /* integer division */
-
-        /* avoid zero for tiny rates: at least 1 byte/ms */
-        if (bytes_per_ms == 0)
-            bytes_per_ms = 1;
-
+        u64 bytes_per_ms = bytes_per_sec / 1000ULL;
+        if (!bytes_per_ms) bytes_per_ms = 1;
         vp->rate_bytes_per_ms = bytes_per_ms;
-        /* bucket capacity = burst_ms worth of tokens (configurable) */
         vp->bucket_capacity_bytes = vp->rate_bytes_per_ms * (u64)param_burst_ms;
     } else {
         vp->rate_bytes_per_ms = 0;
         vp->bucket_capacity_bytes = 0;
     }
-
     vp->bucket_tokens = vp->bucket_capacity_bytes;
     vp->last_bucket_update = ktime_get();
+
     u64_stats_init(&vp->stats_sync);
 
-    if ((err = register_netdev(vshape_dev))) {
-        pr_err("register_netdev failed: %d\n", err);
-        free_netdev(vshape_dev);
+    *pdev = dev;
+    return 0;
+}
+
+/* ---------- init/exit: create pair ---------- */
+static int __init vshape_init(void)
+{
+    int err;
+
+    err = vshape_init_one(&vshapeA_dev, "vshapeA%d");
+    if (err)
+        return err;
+
+    err = vshape_init_one(&vshapeB_dev, "vshapeB%d");
+    if (err) {
+        free_netdev(vshapeA_dev);
+        vshapeA_dev = NULL;
         return err;
     }
 
-    if ((err = vshape_nl_init())) {
+    /* link peers (cast netdev_priv to our priv type) */
+    vshape_priv(vshapeA_dev)->peer = vshapeB_dev;
+    vshape_priv(vshapeB_dev)->peer = vshapeA_dev;
+
+    /* register */
+    err = register_netdev(vshapeA_dev);
+    if (err) {
+        pr_err("register %s failed: %d\n", vshapeA_dev->name, err);
+        free_netdev(vshapeA_dev);
+        free_netdev(vshapeB_dev);
+        vshapeA_dev = vshapeB_dev = NULL;
+        return err;
+    }
+
+    err = register_netdev(vshapeB_dev);
+    if (err) {
+        pr_err("register %s failed: %d\n", vshapeB_dev->name, err);
+        unregister_netdev(vshapeA_dev);
+        free_netdev(vshapeA_dev);
+        free_netdev(vshapeB_dev);
+        vshapeA_dev = vshapeB_dev = NULL;
+        return err;
+    }
+
+    err = vshape_nl_init();
+    if (err) {
         pr_err("netlink init failed: %d\n", err);
-        unregister_netdev(vshape_dev);
-        free_netdev(vshape_dev);
+        unregister_netdev(vshapeB_dev);
+        unregister_netdev(vshapeA_dev);
+        free_netdev(vshapeB_dev);
+        free_netdev(vshapeA_dev);
+        vshapeA_dev = vshapeB_dev = NULL;
         return err;
     }
 
-    pr_info("vshape0 created: name=%s delay=%u ms jitter=%u ms loss=%u ppm rate=%u kbps burst=%u ms\n",
-            vshape_dev->name, param_delay_ms, param_jitter_ms, param_loss_ppm,
-            param_rate_kbps, param_burst_ms);
+    pr_info("pair created: %s <-> %s  delay=%u ms jitter=%u ms loss=%u ppm rate=%u kbps burst=%u ms passthrough=%u maxq=%u\n",
+            vshapeA_dev->name, vshapeB_dev->name,
+            param_delay_ms, param_jitter_ms, param_loss_ppm,
+            param_rate_kbps, param_burst_ms, param_passthrough, param_max_queue);
 
     return 0;
 }
 
-static void __exit vshape_exit(void)
+static void free_end(struct net_device **pdev)
 {
-    struct vshape_priv *vp = netdev_priv(vshape_dev);
-    struct vshape_qitem *qitem, *tmp;
+    struct vshape_priv *vp;
+    struct vshape_qitem *q, *tmp;
     unsigned int freed = 0;
 
-    pr_info("vshape_exit: tearing down device %s\n", vshape_dev->name);
+    if (!*pdev)
+        return;
 
-    /* stop timer and flush queue */
+    vp = vshape_priv(*pdev);
+
     hrtimer_cancel(&vp->tx_timer);
-
     spin_lock(&vp->queue_lock);
-    list_for_each_entry_safe(qitem, tmp, &vp->tx_queue, list) {
-        list_del(&qitem->list);
+    list_for_each_entry_safe(q, tmp, &vp->tx_queue, list) {
+        list_del(&q->list);
         if (vp->queue_len)
             vp->queue_len--;
-        dev_kfree_skb(qitem->skb);
-        kfree(qitem);
+        dev_kfree_skb(q->skb);
+        kfree(q);
         freed++;
     }
     spin_unlock(&vp->queue_lock);
-
     if (freed)
-        pr_info("vshape_exit: freed %u queued skbs\n", freed);
+        pr_info("%s: freed %u queued skbs\n", (*pdev)->name, freed);
+
+    unregister_netdev(*pdev);
+    free_netdev(*pdev);
+    *pdev = NULL;
+}
+
+static void __exit vshape_exit(void)
+{
+    pr_info("removing pair: %s <-> %s\n",
+            vshapeA_dev ? vshapeA_dev->name : "(none)",
+            vshapeB_dev ? vshapeB_dev->name : "(none)");
 
     vshape_nl_exit();
-    unregister_netdev(vshape_dev);
-    free_netdev(vshape_dev);
-
-    pr_info("vshape0 removed\n");
+    free_end(&vshapeA_dev);
+    free_end(&vshapeB_dev);
 }
 
 module_init(vshape_init);
