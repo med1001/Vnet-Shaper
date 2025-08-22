@@ -32,7 +32,7 @@
 MODULE_AUTHOR("Your Name <you@example.com>");
 MODULE_DESCRIPTION("Two-ended virtual NIC with latency/jitter/loss/rate shaping");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("2.0");
+MODULE_VERSION("2.1");
 
 /* ---------- Tunables (defaults) ---------- */
 unsigned int param_delay_ms = 50;
@@ -98,8 +98,10 @@ struct vshape_priv {
     /* statistics */
     struct u64_stats_sync stats_sync;
     u64 tx_packets;   /* packets accepted from this end (before shaping) */
+    u64 tx_bytes;     /* bytes accepted from this end */
     u64 tx_dropped;   /* dropped by loss or queue full */
     u64 rx_packets;   /* packets delivered to peer's stack */
+    u64 rx_bytes;     /* bytes delivered to peer */
 };
 
 /* Exactly one pair per module load */
@@ -162,10 +164,26 @@ static bool vshape_should_drop(void)
 static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
 {
     struct vshape_priv *vp = container_of(timer, struct vshape_priv, tx_timer);
-    struct vshape_priv *peer_vp = vshape_priv(vp->peer);
+    struct net_device *peer_dev = vp->peer;
     ktime_t now = ktime_get();
     int processed = 0;
     bool has_items = false;
+
+    /* defensive: if we don't have a valid peer, drop queued items (safe) */
+    if (!peer_dev) {
+        pr_warn_ratelimited("%s: timer running but peer is NULL, flushing queue\n", vp->dev ? vp->dev->name : "(unknown)");
+        spin_lock(&vp->queue_lock);
+        while (!list_empty(&vp->tx_queue)) {
+            struct vshape_qitem *q = list_first_entry(&vp->tx_queue, struct vshape_qitem, list);
+            list_del(&q->list);
+            if (vp->queue_len)
+                vp->queue_len--;
+            dev_kfree_skb(q->skb);
+            kfree(q);
+        }
+        spin_unlock(&vp->queue_lock);
+        return HRTIMER_NORESTART;
+    }
 
     while (1) {
         struct vshape_qitem *q = NULL;
@@ -192,14 +210,19 @@ static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
             vp->queue_len--;
         spin_unlock(&vp->queue_lock);
 
-        /* deliver to peer */
-        q->skb->dev = vp->peer;
-        q->skb->protocol = eth_type_trans(q->skb, vp->peer);
+        /* deliver to peer (peer still valid as checked above) */
+        q->skb->dev = peer_dev;
+        q->skb->protocol = eth_type_trans(q->skb, peer_dev);
         netif_rx(q->skb);
 
-        u64_stats_update_begin(&peer_vp->stats_sync);
-        peer_vp->rx_packets++;
-        u64_stats_update_end(&peer_vp->stats_sync);
+        /* update peer stats (rx) if peer's priv exists */
+        if (peer_dev && netdev_priv(peer_dev)) {
+            struct vshape_priv *peer_vp = vshape_priv(peer_dev);
+            u64_stats_update_begin(&peer_vp->stats_sync);
+            peer_vp->rx_packets++;
+            peer_vp->rx_bytes += q->skb->len;
+            u64_stats_update_end(&peer_vp->stats_sync);
+        }
 
         kfree(q);
         processed++;
@@ -248,16 +271,19 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
 
         u64_stats_update_begin(&vp->stats_sync);
         vp->tx_packets++;
+        vp->tx_bytes += skb->len;
         u64_stats_update_end(&vp->stats_sync);
 
         skb->dev = vp->peer;
         skb->protocol = eth_type_trans(skb, vp->peer);
         netif_rx(skb);
 
-        u64_stats_update_begin(&peer_vp->stats_sync);
-        peer_vp->rx_packets++;
-        u64_stats_update_end(&peer_vp->stats_sync);
-
+        if (peer_vp) {
+            u64_stats_update_begin(&peer_vp->stats_sync);
+            peer_vp->rx_packets++;
+            peer_vp->rx_bytes += skb->len;
+            u64_stats_update_end(&peer_vp->stats_sync);
+        }
         return NETDEV_TX_OK;
     }
 
@@ -298,6 +324,7 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
         vp->queue_len++;
         u64_stats_update_begin(&vp->stats_sync);
         vp->tx_packets++;
+        vp->tx_bytes += skb->len;
         u64_stats_update_end(&vp->stats_sync);
 
         if (!hrtimer_is_queued(&vp->tx_timer))
@@ -331,17 +358,22 @@ static void vshape_get_stats64(struct net_device *dev, struct rtnl_link_stats64 
     struct vshape_priv *vp = vshape_priv(dev);
     unsigned int seq;
     u64 t, d, r;
+    u64 txb, rxb;
 
     do {
         seq = u64_stats_fetch_begin(&vp->stats_sync);
         t = vp->tx_packets;
         d = vp->tx_dropped;
         r = vp->rx_packets;
+        txb = vp->tx_bytes;
+        rxb = vp->rx_bytes;
     } while (u64_stats_fetch_retry(&vp->stats_sync, seq));
 
     stats->tx_packets = t;
     stats->tx_dropped = d;
     stats->rx_packets = r;
+    stats->tx_bytes = txb;
+    stats->rx_bytes = rxb;
 }
 
 static const struct net_device_ops vshape_netdev_ops = {
