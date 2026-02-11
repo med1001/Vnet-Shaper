@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+# vshape_test3_safe.sh
+# Safe, minimal automated test for TEST-3 (rate limiting UDP)
+# - loads module (or reloads it) with safe params
+# - configures vshape pair in net namespaces (creates ns if needed)
+# - starts tcpdump, iperf3 server, runs iperf3 client UDP (small BW)
+# - gathers logs in /tmp and cleans up background processes
+#
+# Usage: sudo ./vshape_test3_safe.sh [--module path] [--bw 5M] [--rate 2000] [--time 8]
+
+set -euo pipefail
+
+MODULE_PATH="./kernel/vshape_mod.ko"
+OUTDIR="/tmp/vshape_test3_safe.$(date +%s)"
+CLIENT_BW="5M"      # iperf client requested bandwidth
+RATE_KBPS=2000      # module shaping target rate in kbps (2 Mbps)
+DELAY_MS=0
+JITTER_MS=0
+DURATION=8
+
+# parse args simple
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --module) MODULE_PATH="$2"; shift 2;;
+    --bw) CLIENT_BW="$2"; shift 2;;
+    --rate) RATE_KBPS="$2"; shift 2;;
+    --time) DURATION="$2"; shift 2;;
+    --help) echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8]"; exit 0;;
+    *) echo "Unknown $1"; shift;;
+  esac
+done
+
+if (( EUID != 0 )); then
+  echo "Run as root"; exit 1
+fi
+
+mkdir -p "$OUTDIR"
+echo "outdir=$OUTDIR"
+LOG="$OUTDIR/run.log"
+exec > >(tee -a "$LOG") 2>&1
+
+echo "=== vshape TEST3 SAFE ==="
+echo "module: $MODULE_PATH"
+echo "requested client BW: $CLIENT_BW, module rate: ${RATE_KBPS} kbps, duration: ${DURATION}s"
+
+modname="$(basename "$MODULE_PATH" .ko)"
+
+cleanup() {
+    echo "[CLEANUP] killing bg jobs..."
+    pkill -P $$ 2>/dev/null || true
+    sleep 0.3
+    # try to stop iperf / tcpdump if still running
+    pkill -f "iperf3 -s" 2>/dev/null || true
+    pkill -f "tcpdump -i" 2>/dev/null || true
+    sleep 0.2
+    echo "[CLEANUP] done."
+}
+trap cleanup EXIT
+
+# unload module if already loaded (safer to reinsert with params)
+if lsmod | awk '{print $1}' | grep -q "^${modname}$"; then
+    echo "[INFO] module $modname already loaded -> trying to rmmod (best-effort)"
+    if ! rmmod "$modname" 2>/dev/null; then
+        echo "[WARN] could not rmmod $modname; continuing (may have stale state)"
+    else
+        echo "[INFO] rmmod succeeded"
+    fi
+fi
+
+# insert module with params so per-end values are set at init
+echo "[INFO] inserting module with params rate=${RATE_KBPS}kbps delay=${DELAY_MS}ms jitter=${JITTER_MS}ms"
+if ! insmod "$MODULE_PATH" param_rate_kbps="$RATE_KBPS" param_delay_ms="$DELAY_MS" param_jitter_ms="$JITTER_MS"; then
+    echo "[ERROR] insmod failed"; exit 1
+fi
+
+sleep 0.5
+
+# wait for device pair (in root namespace initially)
+WAIT=8
+DEV_A=""
+DEV_B=""
+while (( WAIT-- > 0 )); do
+    DEV_A="$(ip -o link show | awk -F': ' '{print $2}' | grep '^vshapeA' || true | head -n1)"
+    DEV_B="$(ip -o link show | awk -F': ' '{print $2}' | grep '^vshapeB' || true | head -n1)"
+    if [[ -n "$DEV_A" && -n "$DEV_B" ]]; then
+        echo "[INFO] found pair in root ns: $DEV_A <-> $DEV_B"
+        ROOT_MODE=1
+        break
+    fi
+    sleep 1
+done
+
+# If not in root, check common ns names
+if [[ -z "$DEV_A" || -z "$DEV_B" ]]; then
+    if ip netns list 2>/dev/null | grep -q '^ns1_vshape'; then
+        echo "[INFO] checking in netns ns1_vshape/ns2_vshape"
+        if ip netns exec ns1_vshape ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -q '^vshapeA'; then
+            DEV_A="vshapeA0"
+            DEV_B="vshapeB0"
+            ROOT_MODE=0
+            echo "[INFO] found vshapeA/B inside netns ns1_vshape/ns2_vshape"
+        fi
+    fi
+fi
+
+# If still not found: try to wait a little longer
+if [[ -z "$DEV_A" || -z "$DEV_B" ]]; then
+    echo "[ERROR] cannot find vshape pair (vshapeA* and vshapeB*). Check dmesg. Exiting."
+    dmesg | tail -n 40 | sed -n '1,200p'
+    exit 1
+fi
+
+# If devices are in root, move them to netns ns1/ns2 (we create them)
+if [[ "${ROOT_MODE:-0}" -eq 1 ]]; then
+    NS1="ns1_vshape"
+    NS2="ns2_vshape"
+    echo "[INFO] creating netns $NS1 $NS2 (if missing) and moving devices"
+    ip netns add "$NS1" 2>/dev/null || true
+    ip netns add "$NS2" 2>/dev/null || true
+
+    echo "[INFO] moving $DEV_A -> $NS1"
+    ip link set "$DEV_A" netns "$NS1"
+    echo "[INFO] moving $DEV_B -> $NS2"
+    ip link set "$DEV_B" netns "$NS2"
+else
+    NS1="ns1_vshape"
+    NS2="ns2_vshape"
+fi
+
+sleep 0.2
+
+# configure devices inside namespaces
+echo "[INFO] configuring interfaces and IPs"
+ip netns exec "$NS1" ip link set lo up
+ip netns exec "$NS1" ip link set dev vshapeA0 up || true
+ip netns exec "$NS1" ip addr flush dev vshapeA0 2>/dev/null || true
+ip netns exec "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
+
+ip netns exec "$NS2" ip link set lo up
+ip netns exec "$NS2" ip link set dev vshapeB0 up || true
+ip netns exec "$NS2" ip addr flush dev vshapeB0 2>/dev/null || true
+ip netns exec "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
+
+# disable offloads best-effort (minimize host acceleration)
+if command -v ethtool >/dev/null 2>&1; then
+    ip netns exec "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off 2>/dev/null || true
+    ip netns exec "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off 2>/dev/null || true
+fi
+
+# start background tcpdump on B (limited time via timeout if available)
+PCAP="$OUTDIR/test3.pcap"
+TCPDUMP_LOG="$OUTDIR/tcpdump.err"
+echo "[INFO] starting tcpdump in $NS2 (writing $PCAP)"
+if command -v timeout >/dev/null 2>&1; then
+    ip netns exec "$NS2" timeout $((DURATION + 6)) tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
+    TCPDUMP_PID=$!
+else
+    ip netns exec "$NS2" tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
+    TCPDUMP_PID=$!
+fi
+echo "[INFO] tcpdump pid=$TCPDUMP_PID"
+sleep 0.5
+
+# start iperf3 server inside NS2
+IPERF_SERVER_LOG="$OUTDIR/iperf_server.log"
+echo "[INFO] starting iperf3 server in $NS2"
+ip netns exec "$NS2" iperf3 -s >"$IPERF_SERVER_LOG" 2>&1 &
+IPERF_SERVER_PID=$!
+sleep 0.6
+echo "[INFO] iperf3 server pid=$IPERF_SERVER_PID"
+
+# run iperf3 client UDP from NS1
+CLIENT_OUT="$OUTDIR/iperf_client.json"
+echo "[INFO] running iperf3 client UDP -> 10.42.1.2, bw=$CLIENT_BW, duration=${DURATION}s"
+set +e
+ip netns exec "$NS1" iperf3 -c 10.42.1.2 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+RC=$?
+set -e
+echo "[INFO] iperf3 client exited rc=$RC (saved to $CLIENT_OUT)"
+
+# give tcpdump a moment to flush if still running
+sleep 1
+
+# collect results
+echo "===== RESULTS ====="
+echo "iperf client output (grep bits_per_second):"
+grep -o '"bits_per_second":[^,]*' "$CLIENT_OUT" | head -n 5 || true
+echo "------ full iperf client JSON head -----"
+head -n 80 "$CLIENT_OUT" || true
+
+echo "dmesg tail for module:"
+dmesg | tail -n 80 | grep -i -E 'vnet_shape|vshape' || true
+
+echo "tcpdump summary (first 40 lines):"
+if [[ -f "$PCAP" ]]; then
+    tcpdump -r "$PCAP" -n -tttt | head -n 40 || true
+else
+    echo "no pcap found at $PCAP"
+fi
+
+echo "link stats (brief):"
+ip netns exec "$NS1" ip -s link show vshapeA0 || true
+ip netns exec "$NS2" ip -s link show vshapeB0 || true
+
+echo "Logs saved under $OUTDIR"
+echo "When done, you can cleanup: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname (if desired)"
+
+# final exit (trap will run cleanup)
+exit 0
+
