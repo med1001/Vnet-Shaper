@@ -95,7 +95,7 @@ ping -I vshape0 8.8.8.8
 
 ## License
 
-MIT License. do whatever you want, just don’t break real networks with it
+GPL-3.0 license. do whatever you want, just don’t break real networks with it
 
 ---
 
