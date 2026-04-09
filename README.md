@@ -28,7 +28,13 @@ Install **Linux kernel headers** for your running kernel (and the usual build to
 sudo apt install build-essential linux-headers-$(uname -r)
 ```
 
-Install **libnl** development files for the userspace tool (names vary by distro), e.g. `libnl-3-dev` and `libnl-genl-3-dev`.
+Install **libnl** development files for **`vshape_ctl`**. On Debian/Ubuntu, Generic Netlink headers and `pkg-config` come from:
+
+```bash
+sudo apt install libnl-genl-3-dev pkg-config
+```
+
+(`libnl-genl-3-dev` pulls in the core libnl headers.) The `userspace/Makefile` uses `pkg-config libnl-genl-3.0` when available, with a fallback include path.
 
 From the **repository root**:
 

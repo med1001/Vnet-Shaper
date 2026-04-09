@@ -11,6 +11,10 @@ extern unsigned int param_rate_kbps;
 // Declare update function from vnet_shape.c
 extern void vshape_update_rate_limit(void);
 
+/* Prototypes: called from vnet_shape.c (-Wmissing-prototypes) */
+int __init vshape_nl_init(void);
+void vshape_nl_exit(void);
+
 static struct genl_family vshape_family;
 
 static const struct nla_policy vshape_policy[VSHAPE_ATTR_MAX + 1] = {
