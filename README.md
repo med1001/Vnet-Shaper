@@ -2,7 +2,7 @@
 
 ## Overview
 
-**vnet-shape** is a Linux kernel module that registers **two** virtual Ethernet interfaces (**`vshapeA*`** and **`vshapeB*`**) wired together in software. Traffic sent on one interface is optionally delayed, jittered, dropped, and rate-limited before being delivered to the peer—similar to a **veth pair**, with **emulated network conditions** for education and demos. No physical hardware is involved.
+**vnet-shape** is a Linux kernel module that registers **two** virtual Ethernet interfaces (**`vshapeA*`** and **`vshapeB*`**) wired together in software. Traffic sent on one interface is optionally delayed, jittered, dropped, and rate-limited before being delivered to the peer, similar to a **veth pair**, with **emulated network conditions** for education and demos. No physical hardware is involved.
 
 For a deeper walkthrough of components and data flow, see **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
