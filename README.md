@@ -155,6 +155,8 @@ sudo ./tests/test_rate_limit_udp.sh
 
 Optional flags: `--module`, `--bw`, `--rate`, `--time` (see script header).
 
+If the script appears **stuck** while configuring interfaces, it is often blocked in **`ip netns exec`** waiting on the kernel **RTNL** lock (another tool is holding the network lock). Check with `ss -tp`, try stopping **NetworkManager** briefly, or remove leftover namespaces: `sudo ip netns del ns1_vshape ns2_vshape`. You can raise per-command waits with `IP_TIMEOUT=120 sudo ./tests/test_rate_limit_udp.sh`.
+
 ---
 
 ## Development notes

@@ -7,6 +7,10 @@
 # - gathers logs in /tmp and cleans up background processes
 #
 # Usage: sudo ./vshape_test3_safe.sh [--module path] [--bw 5M] [--rate 2000] [--time 8]
+#
+# Stuck after "configuring interfaces"? Usually `ip netns exec` is waiting on the kernel
+# RTNL lock. Check: `ss -tp | grep -E '^\s*ip'`; try `systemctl stop NetworkManager` briefly;
+# remove stale namespaces: `ip netns del ns1_vshape` / `ns2_vshape`. Increase wait: IP_TIMEOUT=120.
 
 set -euo pipefail
 
@@ -37,7 +41,49 @@ fi
 mkdir -p "$OUTDIR"
 echo "outdir=$OUTDIR"
 LOG="$OUTDIR/run.log"
-exec > >(tee -a "$LOG") 2>&1
+# Line-buffer tee when stdbuf exists (reduces oddities with long pipelines).
+if command -v stdbuf >/dev/null 2>&1; then
+  exec > >(stdbuf -oL tee -a "$LOG") 2>&1
+else
+  exec > >(tee -a "$LOG") 2>&1
+fi
+
+# Seconds for each `ip netns exec ...` (not for iperf duration). Increase if needed.
+IP_TIMEOUT="${IP_TIMEOUT:-45}"
+
+step_tty() {
+  if [[ -w /dev/tty ]]; then
+    echo "$@" > /dev/tty
+  fi
+}
+
+# Run a command inside a net namespace with an optional timeout (GNU coreutils).
+run_ns() {
+  local ns="$1"
+  shift
+  step_tty "[RUN] ip netns exec ${ns} $*"
+  if command -v timeout >/dev/null 2>&1; then
+    if ! timeout "${IP_TIMEOUT}" ip netns exec "$ns" "$@"; then
+      echo "[ERROR] ip netns exec failed or exceeded ${IP_TIMEOUT}s: $ns -> $*"
+      echo "[HINT] Another process may hold RTNL (see: ss -tp); try stopping NetworkManager, or delete stale netns."
+      exit 1
+    fi
+  else
+    ip netns exec "$ns" "$@"
+  fi
+}
+
+# Same as run_ns but never aborts the script (for flush / ethtool / optional "link up").
+run_ns_ignore() {
+  local ns="$1"
+  shift
+  step_tty "[RUN] ip netns exec ${ns} $* (non-fatal)"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${IP_TIMEOUT}" ip netns exec "$ns" "$@" 2>/dev/null || true
+  else
+    ip netns exec "$ns" "$@" 2>/dev/null || true
+  fi
+}
 
 echo "=== vshape TEST3 SAFE ==="
 echo "module: $MODULE_PATH"
@@ -131,20 +177,20 @@ sleep 0.2
 
 # configure devices inside namespaces
 echo "[INFO] configuring interfaces and IPs"
-ip netns exec "$NS1" ip link set lo up
-ip netns exec "$NS1" ip link set dev vshapeA0 up || true
-ip netns exec "$NS1" ip addr flush dev vshapeA0 2>/dev/null || true
-ip netns exec "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
+run_ns "$NS1" ip link set lo up
+run_ns_ignore "$NS1" ip link set dev vshapeA0 up
+run_ns_ignore "$NS1" ip addr flush dev vshapeA0
+run_ns "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
 
-ip netns exec "$NS2" ip link set lo up
-ip netns exec "$NS2" ip link set dev vshapeB0 up || true
-ip netns exec "$NS2" ip addr flush dev vshapeB0 2>/dev/null || true
-ip netns exec "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
+run_ns "$NS2" ip link set lo up
+run_ns_ignore "$NS2" ip link set dev vshapeB0 up
+run_ns_ignore "$NS2" ip addr flush dev vshapeB0
+run_ns "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
 
 # disable offloads best-effort (minimize host acceleration)
 if command -v ethtool >/dev/null 2>&1; then
-    ip netns exec "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off 2>/dev/null || true
-    ip netns exec "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off 2>/dev/null || true
+    run_ns_ignore "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off
+    run_ns_ignore "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off
 fi
 
 # start background tcpdump on B (limited time via timeout if available)
@@ -199,8 +245,8 @@ else
 fi
 
 echo "link stats (brief):"
-ip netns exec "$NS1" ip -s link show vshapeA0 || true
-ip netns exec "$NS2" ip -s link show vshapeB0 || true
+run_ns_ignore "$NS1" ip -s link show vshapeA0
+run_ns_ignore "$NS2" ip -s link show vshapeB0
 
 echo "Logs saved under $OUTDIR"
 echo "When done, you can cleanup: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname (if desired)"
