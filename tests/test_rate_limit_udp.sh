@@ -177,15 +177,15 @@ sleep 0.2
 
 # configure devices inside namespaces
 echo "[INFO] configuring interfaces and IPs"
+# Avoid `ip addr flush`: on some setups it can leave `ip` in uninterruptible sleep (D state),
+# so `timeout` cannot kill it and the script appears hung. `ip addr replace` adds or updates.
 run_ns "$NS1" ip link set lo up
 run_ns_ignore "$NS1" ip link set dev vshapeA0 up
-run_ns_ignore "$NS1" ip addr flush dev vshapeA0
-run_ns "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
+run_ns "$NS1" ip addr replace 10.42.1.1/24 dev vshapeA0
 
 run_ns "$NS2" ip link set lo up
 run_ns_ignore "$NS2" ip link set dev vshapeB0 up
-run_ns_ignore "$NS2" ip addr flush dev vshapeB0
-run_ns "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
+run_ns "$NS2" ip addr replace 10.42.1.2/24 dev vshapeB0
 
 # disable offloads best-effort (minimize host acceleration)
 if command -v ethtool >/dev/null 2>&1; then
