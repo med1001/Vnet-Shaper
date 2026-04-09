@@ -114,6 +114,17 @@ static inline struct vshape_priv *vshape_priv(struct net_device *dev)
     return (struct vshape_priv *)netdev_priv(dev);
 }
 
+/*
+ * Small compatibility wrapper: avoid prandom_u32_max(), which is not
+ * available on newer kernels. get_random_u32() is widely available.
+ */
+static u32 vshape_rand_below(u32 ceil)
+{
+    if (!ceil)
+        return 0;
+    return get_random_u32() % ceil;
+}
+
 /* ---------- Token bucket helpers ---------- */
 static void vshape_bucket_update(struct vshape_priv *vp)
 {
@@ -157,7 +168,7 @@ static bool vshape_should_drop(void)
 {
     if (!param_loss_ppm)
         return false;
-    return prandom_u32_max(1000000) < param_loss_ppm;
+    return vshape_rand_below(1000000) < param_loss_ppm;
 }
 
 /* ---------- timer: dequeue and deliver to peer ---------- */
@@ -303,7 +314,7 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
 
     /* compute release time */
     {
-        s32 jitter = param_jitter_ms ? (s32)prandom_u32_max(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
+        s32 jitter = param_jitter_ms ? (s32)vshape_rand_below(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
         ktime_t delay = ms_to_ktime(param_delay_ms + jitter);
         ktime_t release_time = ktime_add(ktime_get(), delay);
         struct vshape_qitem *q = kmalloc(sizeof(*q), GFP_ATOMIC);
@@ -402,6 +413,8 @@ static void vshape_setup(struct net_device *dev)
 }
 
 /* ---------- runtime update helper (netlink can call this) ---------- */
+void vshape_update_rate_limit(void);
+
 void vshape_update_rate_limit(void)
 {
     struct net_device *devs[2] = { vshapeA_dev, vshapeB_dev };
