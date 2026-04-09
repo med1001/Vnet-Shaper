@@ -29,7 +29,7 @@
 
 #include "netlink.h"
 
-MODULE_AUTHOR("Your Name <you@example.com>");
+MODULE_AUTHOR("Mohamed BEN MOUSSA");
 MODULE_DESCRIPTION("Two-ended virtual NIC with latency/jitter/loss/rate shaping");
 MODULE_LICENSE("GPL");
 MODULE_VERSION("2.1");
