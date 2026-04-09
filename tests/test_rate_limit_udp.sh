@@ -38,6 +38,18 @@ if (( EUID != 0 )); then
   echo "Run as root"; exit 1
 fi
 
+if ! command -v iperf3 >/dev/null 2>&1; then
+  echo "[ERROR] iperf3 is not installed — this test needs it for UDP throughput."
+  echo "Install (Debian/Ubuntu): sudo apt install iperf3"
+  exit 1
+fi
+
+SKIP_TCPDUMP=
+if ! command -v tcpdump >/dev/null 2>&1; then
+  echo "[WARN] tcpdump not found — PCAP will be skipped. Install: sudo apt install tcpdump"
+  SKIP_TCPDUMP=1
+fi
+
 mkdir -p "$OUTDIR"
 echo "outdir=$OUTDIR"
 LOG="$OUTDIR/run.log"
@@ -196,16 +208,21 @@ fi
 # start background tcpdump on B (limited time via timeout if available)
 PCAP="$OUTDIR/test3.pcap"
 TCPDUMP_LOG="$OUTDIR/tcpdump.err"
-echo "[INFO] starting tcpdump in $NS2 (writing $PCAP)"
-if command -v timeout >/dev/null 2>&1; then
-    ip netns exec "$NS2" timeout $((DURATION + 6)) tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
-    TCPDUMP_PID=$!
+if [[ -n "$SKIP_TCPDUMP" ]]; then
+    echo "[INFO] skipping tcpdump (not installed)"
+    TCPDUMP_PID=""
 else
-    ip netns exec "$NS2" tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
-    TCPDUMP_PID=$!
+    echo "[INFO] starting tcpdump in $NS2 (writing $PCAP)"
+    if command -v timeout >/dev/null 2>&1; then
+        ip netns exec "$NS2" timeout $((DURATION + 6)) tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
+        TCPDUMP_PID=$!
+    else
+        ip netns exec "$NS2" tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
+        TCPDUMP_PID=$!
+    fi
+    echo "[INFO] tcpdump pid=$TCPDUMP_PID"
+    sleep 0.5
 fi
-echo "[INFO] tcpdump pid=$TCPDUMP_PID"
-sleep 0.5
 
 # start iperf3 server inside NS2
 IPERF_SERVER_LOG="$OUTDIR/iperf_server.log"

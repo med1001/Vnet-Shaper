@@ -149,6 +149,12 @@ More detail: **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)**.
 
 ## Tests
 
+The script needs **`iperf3`** (required) and **`tcpdump`** (optional, for the saved `.pcap`). On Debian/Ubuntu:
+
+```bash
+sudo apt install iperf3 tcpdump
+```
+
 ```bash
 sudo ./tests/test_rate_limit_udp.sh
 ```
