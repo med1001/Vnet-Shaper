@@ -167,6 +167,14 @@ On **VirtualBox**, `tcpdump -s 0` (full snaplen) inside netns has been reported 
 sudo ./tests/test_rate_limit_udp.sh --quick --time 4 --bw 2M --rate 1000
 ```
 
+If the guest still hangs on **`ip addr`**, stop **NetworkManager** during the test (it can contend for RTNL / interface setup):
+
+```bash
+VSHAPE_STOP_NM=1 sudo ./tests/test_rate_limit_udp.sh --quick --time 4
+```
+
+Rebuild the kernel module after pulling updates (netdev **carrier** + no fake HW checksum offload).
+
 If the script appears **stuck** while configuring interfaces, it is often blocked in **`ip netns exec`** waiting on the kernel **RTNL** lock (another tool is holding the network lock). **`ip addr flush`** can also wedge in **D state** (uninterruptible sleep), where even `timeout` cannot stop the process. The test script uses **`ip addr replace`** instead of flush+add to avoid that. Otherwise check with `ss -tp`, try stopping **NetworkManager** briefly, or remove leftover namespaces: `sudo ip netns del ns1_vshape ns2_vshape`. You can raise per-command waits with `IP_TIMEOUT=120 sudo ./tests/test_rate_limit_udp.sh`.
 
 ---

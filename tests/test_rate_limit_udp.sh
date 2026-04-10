@@ -10,6 +10,7 @@
 #   --quick         same as --no-netns --no-tcpdump
 #
 # Stuck on RTNL: IP_TIMEOUT=120; try stopping NetworkManager; ip netns del ns1_vshape ns2_vshape
+# Hang on `ip addr`: VSHAPE_STOP_NM=1 sudo ... (stops NetworkManager before loading the module)
 
 set -euo pipefail
 
@@ -144,6 +145,11 @@ echo "mode: netns=$USE_NETNS tcpdump=$([[ -z "${SKIP_TCPDUMP:-}" ]] && echo on |
 echo "requested client BW: $CLIENT_BW, module rate: ${RATE_KBPS} kbps, duration: ${DURATION}s"
 
 modname="$(basename "$MODULE_PATH" .ko)"
+
+if [[ "${VSHAPE_STOP_NM:-0}" == "1" ]] && command -v systemctl >/dev/null 2>&1; then
+  systemctl stop NetworkManager 2>/dev/null || true
+  echo "[INFO] VSHAPE_STOP_NM=1: NetworkManager stopped (start again after test: systemctl start NetworkManager)"
+fi
 
 cleanup() {
     echo "[CLEANUP] killing bg jobs..."
