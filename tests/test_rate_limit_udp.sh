@@ -9,6 +9,8 @@
 #   --no-tcpdump    skip capture (tcpdump + vbox can freeze the guest)
 #   --quick         same as --no-netns --no-tcpdump
 #   --smoke         only insmod + check /sys/class/net/vshapeA0|B0 + rmmod (no ip(8), no iperf3)
+#   --configure-only  IP setup then exit (no iperf — use if VM hard-freezes when starting traffic)
+#   --passthrough   insmod with param_passthrough=1 (no queue/timer shaping path)
 #
 # Stuck on RTNL: IP_TIMEOUT=120; try stopping NetworkManager; ip netns del ns1_vshape ns2_vshape
 # Hang on `ip addr`: VSHAPE_STOP_NM=1 sudo ... (stops NetworkManager before loading the module)
@@ -25,6 +27,8 @@ DURATION=8
 USE_NETNS=1
 NO_TCPDUMP_OPT=0
 SMOKE=0
+CONFIGURE_ONLY=0
+PASSTHROUGH=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,8 +40,10 @@ while [[ $# -gt 0 ]]; do
     --no-tcpdump) NO_TCPDUMP_OPT=1; shift;;
     --quick) USE_NETNS=0; NO_TCPDUMP_OPT=1; shift;;
     --smoke) SMOKE=1; shift;;
+    --configure-only) CONFIGURE_ONLY=1; shift;;
+    --passthrough) PASSTHROUGH=1; shift;;
     --help)
-      echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8] [--no-netns] [--no-tcpdump] [--quick] [--smoke]"
+      echo "Usage: $0 [options]  see script header (--quick --smoke --configure-only --passthrough ...)"
       exit 0
       ;;
     *) echo "Unknown $1"; shift;;
@@ -48,7 +54,7 @@ if (( EUID != 0 )); then
   echo "Run as root"; exit 1
 fi
 
-if [[ "$SMOKE" -eq 0 ]] && ! command -v iperf3 >/dev/null 2>&1; then
+if [[ "$SMOKE" -eq 0 && "$CONFIGURE_ONLY" -eq 0 ]] && ! command -v iperf3 >/dev/null 2>&1; then
   echo "[ERROR] iperf3 is not installed — this test needs it for UDP throughput."
   echo "Install (Debian/Ubuntu): sudo apt install iperf3"
   exit 1
@@ -144,7 +150,7 @@ run_cfg_ignore() {
 
 echo "=== vshape TEST3 SAFE ==="
 echo "module: $MODULE_PATH"
-echo "mode: smoke=$SMOKE netns=$USE_NETNS tcpdump=$([[ -z "${SKIP_TCPDUMP:-}" ]] && echo on || echo off)"
+echo "mode: smoke=$SMOKE configure_only=$CONFIGURE_ONLY passthrough=$PASSTHROUGH netns=$USE_NETNS tcpdump=$([[ -z "${SKIP_TCPDUMP:-}" ]] && echo on || echo off)"
 echo "requested client BW: $CLIENT_BW, module rate: ${RATE_KBPS} kbps, duration: ${DURATION}s"
 
 modname="$(basename "$MODULE_PATH" .ko)"
@@ -174,8 +180,10 @@ if lsmod | awk '{print $1}' | grep -q "^${modname}$"; then
     fi
 fi
 
-echo "[INFO] inserting module with params rate=${RATE_KBPS}kbps delay=${DELAY_MS}ms jitter=${JITTER_MS}ms"
-if ! insmod "$MODULE_PATH" param_rate_kbps="$RATE_KBPS" param_delay_ms="$DELAY_MS" param_jitter_ms="$JITTER_MS"; then
+echo "[INFO] inserting module with params rate=${RATE_KBPS}kbps delay=${DELAY_MS}ms jitter=${JITTER_MS}ms passthrough=${PASSTHROUGH}"
+INSMOD_ARGS=(param_rate_kbps="$RATE_KBPS" param_delay_ms="$DELAY_MS" param_jitter_ms="$JITTER_MS")
+[[ "$PASSTHROUGH" -eq 1 ]] && INSMOD_ARGS+=(param_passthrough=1)
+if ! insmod "$MODULE_PATH" "${INSMOD_ARGS[@]}"; then
     echo "[ERROR] insmod failed"; exit 1
 fi
 
@@ -275,6 +283,16 @@ fi
 if command -v ethtool >/dev/null 2>&1; then
     run_cfg_ignore "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off
     run_cfg_ignore "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off
+fi
+
+if [[ "$CONFIGURE_ONLY" -eq 1 ]]; then
+    echo "[INFO] --configure-only: skipping iperf/tcpdump (avoids traffic that can hard-freeze some VMs)"
+    run_cfg_ignore "$NS1" ip -s link show vshapeA0
+    run_cfg_ignore "$NS2" ip -s link show vshapeB0
+    dmesg | tail -n 40 | grep -i -E 'vnet_shape|vshape' || true
+    rmmod "$modname" 2>/dev/null || true
+    echo "[OK] configure-only done; module removed. For throughput test use SSH from host, or try: --quick --passthrough"
+    exit 0
 fi
 
 PCAP="$OUTDIR/test3.pcap"

@@ -175,6 +175,8 @@ VSHAPE_STOP_NM=1 sudo ./tests/test_rate_limit_udp.sh --quick --time 4
 
 Rebuild the kernel module after pulling updates (netdev **carrier** + no fake HW checksum offload).
 
+If the **whole guest freezes** when iperf starts, the console is useless: use **SSH from the host** (VirtualBox port forwarding) to run tests, or use **`--configure-only`** (IP setup only, no traffic). To see whether the freeze is tied to the shaping path, try **`--quick --passthrough`** (module loads with `param_passthrough=1`).
+
 If the script appears **stuck** while configuring interfaces, it is often blocked in **`ip netns exec`** waiting on the kernel **RTNL** lock (another tool is holding the network lock). **`ip addr flush`** can also wedge in **D state** (uninterruptible sleep), where even `timeout` cannot stop the process. The test script uses **`ip addr replace`** instead of flush+add to avoid that. Otherwise check with `ss -tp`, try stopping **NetworkManager** briefly, or remove leftover namespaces: `sudo ip netns del ns1_vshape ns2_vshape`. You can raise per-command waits with `IP_TIMEOUT=120 sudo ./tests/test_rate_limit_udp.sh`.
 
 ---
