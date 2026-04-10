@@ -60,7 +60,7 @@ else
   exec > >(tee -a "$LOG") 2>&1
 fi
 
-# Seconds for each `ip netns exec ...` (not for iperf duration). Increase if needed.
+# Seconds for each `ip netns exec ...` wrapper. Increase if needed.
 IP_TIMEOUT="${IP_TIMEOUT:-45}"
 
 step_tty() {
@@ -224,19 +224,41 @@ else
     sleep 0.5
 fi
 
+# Wrapper for iperf commands executed in namespaces.
+run_iperf_ns() {
+  local ns="$1"
+  shift
+  step_tty "[RUN] ip netns exec ${ns} $*"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${IP_TIMEOUT}" ip netns exec "$ns" "$@"
+  else
+    ip netns exec "$ns" "$@"
+  fi
+}
+
 # start iperf3 server inside NS2
 IPERF_SERVER_LOG="$OUTDIR/iperf_server.log"
 echo "[INFO] starting iperf3 server in $NS2"
-ip netns exec "$NS2" iperf3 -s >"$IPERF_SERVER_LOG" 2>&1 &
+if command -v timeout >/dev/null 2>&1; then
+    # -1 serves one client then exits; timeout avoids indefinite hangs.
+    timeout $((DURATION + 12)) ip netns exec "$NS2" iperf3 -s -1 >"$IPERF_SERVER_LOG" 2>&1 &
+else
+    ip netns exec "$NS2" iperf3 -s -1 >"$IPERF_SERVER_LOG" 2>&1 &
+fi
 IPERF_SERVER_PID=$!
 sleep 0.6
+if ! kill -0 "$IPERF_SERVER_PID" 2>/dev/null; then
+    echo "[ERROR] iperf3 server failed to start in $NS2"
+    head -n 80 "$IPERF_SERVER_LOG" || true
+    exit 1
+fi
 echo "[INFO] iperf3 server pid=$IPERF_SERVER_PID"
 
 # run iperf3 client UDP from NS1
 CLIENT_OUT="$OUTDIR/iperf_client.json"
 echo "[INFO] running iperf3 client UDP -> 10.42.1.2, bw=$CLIENT_BW, duration=${DURATION}s"
 set +e
-ip netns exec "$NS1" iperf3 -c 10.42.1.2 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+run_iperf_ns "$NS1" iperf3 -c 10.42.1.2 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
 RC=$?
 set -e
 echo "[INFO] iperf3 client exited rc=$RC (saved to $CLIENT_OUT)"
