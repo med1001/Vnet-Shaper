@@ -159,7 +159,13 @@ sudo apt install iperf3 tcpdump
 sudo ./tests/test_rate_limit_udp.sh
 ```
 
-Optional flags: `--module`, `--bw`, `--rate`, `--time` (see script header).
+Optional flags: `--module`, `--bw`, `--rate`, `--time`, `--no-netns`, `--no-tcpdump`, `--quick` (see script header).
+
+On **VirtualBox**, `tcpdump -s 0` (full snaplen) inside netns has been reported to **freeze the guest**. Prefer **`--quick`** (no tcpdump, no netns) for a smoke test:
+
+```bash
+sudo ./tests/test_rate_limit_udp.sh --quick --time 4 --bw 2M --rate 1000
+```
 
 If the script appears **stuck** while configuring interfaces, it is often blocked in **`ip netns exec`** waiting on the kernel **RTNL** lock (another tool is holding the network lock). **`ip addr flush`** can also wedge in **D state** (uninterruptible sleep), where even `timeout` cannot stop the process. The test script uses **`ip addr replace`** instead of flush+add to avoid that. Otherwise check with `ss -tp`, try stopping **NetworkManager** briefly, or remove leftover namespaces: `sudo ip netns del ns1_vshape ns2_vshape`. You can raise per-command waits with `IP_TIMEOUT=120 sudo ./tests/test_rate_limit_udp.sh`.
 

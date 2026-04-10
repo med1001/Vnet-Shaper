@@ -1,35 +1,41 @@
 #!/usr/bin/env bash
 # vshape_test3_safe.sh
 # Safe, minimal automated test for TEST-3 (rate limiting UDP)
-# - loads module (or reloads it) with safe params
-# - configures vshape pair in net namespaces (creates ns if needed)
-# - starts tcpdump, iperf3 server, runs iperf3 client UDP (small BW)
-# - gathers logs in /tmp and cleans up background processes
+# - loads module, configures vshape pair, runs iperf3 UDP (optional tcpdump)
 #
-# Usage: sudo ./vshape_test3_safe.sh [--module path] [--bw 5M] [--rate 2000] [--time 8]
+# Usage: sudo ./tests/test_rate_limit_udp.sh [options]
+#   --module PATH   --bw 5M  --rate 2000  --time 8
+#   --no-netns      keep vshapeA/B in root namespace (avoids flaky ip netns exec in some VMs)
+#   --no-tcpdump    skip capture (tcpdump + vbox can freeze the guest)
+#   --quick         same as --no-netns --no-tcpdump
 #
-# Stuck after "configuring interfaces"? Usually `ip netns exec` is waiting on the kernel
-# RTNL lock. Check: `ss -tp | grep -E '^\s*ip'`; try `systemctl stop NetworkManager` briefly;
-# remove stale namespaces: `ip netns del ns1_vshape` / `ns2_vshape`. Increase wait: IP_TIMEOUT=120.
+# Stuck on RTNL: IP_TIMEOUT=120; try stopping NetworkManager; ip netns del ns1_vshape ns2_vshape
 
 set -euo pipefail
 
 MODULE_PATH="./kernel/vshape_mod.ko"
 OUTDIR="/tmp/vshape_test3_safe.$(date +%s)"
-CLIENT_BW="5M"      # iperf client requested bandwidth
-RATE_KBPS=2000      # module shaping target rate in kbps (2 Mbps)
+CLIENT_BW="5M"
+RATE_KBPS=2000
 DELAY_MS=0
 JITTER_MS=0
 DURATION=8
+USE_NETNS=1
+NO_TCPDUMP_OPT=0
 
-# parse args simple
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --module) MODULE_PATH="$2"; shift 2;;
     --bw) CLIENT_BW="$2"; shift 2;;
     --rate) RATE_KBPS="$2"; shift 2;;
     --time) DURATION="$2"; shift 2;;
-    --help) echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8]"; exit 0;;
+    --no-netns) USE_NETNS=0; shift;;
+    --no-tcpdump) NO_TCPDUMP_OPT=1; shift;;
+    --quick) USE_NETNS=0; NO_TCPDUMP_OPT=1; shift;;
+    --help)
+      echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8] [--no-netns] [--no-tcpdump] [--quick]"
+      exit 0
+      ;;
     *) echo "Unknown $1"; shift;;
   esac
 done
@@ -45,7 +51,10 @@ if ! command -v iperf3 >/dev/null 2>&1; then
 fi
 
 SKIP_TCPDUMP=
-if ! command -v tcpdump >/dev/null 2>&1; then
+if [[ "$NO_TCPDUMP_OPT" -eq 1 ]]; then
+  echo "[INFO] skipping tcpdump (--no-tcpdump / --quick)"
+  SKIP_TCPDUMP=1
+elif ! command -v tcpdump >/dev/null 2>&1; then
   echo "[WARN] tcpdump not found — PCAP will be skipped. Install: sudo apt install tcpdump"
   SKIP_TCPDUMP=1
 fi
@@ -53,15 +62,15 @@ fi
 mkdir -p "$OUTDIR"
 echo "outdir=$OUTDIR"
 LOG="$OUTDIR/run.log"
-# Line-buffer tee when stdbuf exists (reduces oddities with long pipelines).
 if command -v stdbuf >/dev/null 2>&1; then
   exec > >(stdbuf -oL tee -a "$LOG") 2>&1
 else
   exec > >(tee -a "$LOG") 2>&1
 fi
 
-# Seconds for each `ip netns exec ...` wrapper. Increase if needed.
 IP_TIMEOUT="${IP_TIMEOUT:-45}"
+# iperf runs longer than a single ip(8) call — do not reuse IP_TIMEOUT for the client
+IPERF_WAIT=$((DURATION + 45))
 
 step_tty() {
   if [[ -w /dev/tty ]]; then
@@ -69,7 +78,6 @@ step_tty() {
   fi
 }
 
-# Run a command inside a net namespace with an optional timeout (GNU coreutils).
 run_ns() {
   local ns="$1"
   shift
@@ -85,7 +93,6 @@ run_ns() {
   fi
 }
 
-# Same as run_ns but never aborts the script (for flush / ethtool / optional "link up").
 run_ns_ignore() {
   local ns="$1"
   shift
@@ -97,8 +104,43 @@ run_ns_ignore() {
   fi
 }
 
+# Configure / stats: netns or root namespace
+run_cfg() {
+  local ns="$1"
+  shift
+  if [[ "$USE_NETNS" -eq 1 ]]; then
+    run_ns "$ns" "$@"
+    return
+  fi
+  step_tty "[RUN] (root) $*"
+  if command -v timeout >/dev/null 2>&1; then
+    if ! timeout "${IP_TIMEOUT}" "$@"; then
+      echo "[ERROR] command failed: $*"
+      exit 1
+    fi
+  else
+    "$@" || exit 1
+  fi
+}
+
+run_cfg_ignore() {
+  local ns="$1"
+  shift
+  if [[ "$USE_NETNS" -eq 1 ]]; then
+    run_ns_ignore "$ns" "$@"
+    return
+  fi
+  step_tty "[RUN] (root) $* (non-fatal)"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${IP_TIMEOUT}" "$@" 2>/dev/null || true
+  else
+    "$@" 2>/dev/null || true
+  fi
+}
+
 echo "=== vshape TEST3 SAFE ==="
 echo "module: $MODULE_PATH"
+echo "mode: netns=$USE_NETNS tcpdump=$([[ -z "${SKIP_TCPDUMP:-}" ]] && echo on || echo off)"
 echo "requested client BW: $CLIENT_BW, module rate: ${RATE_KBPS} kbps, duration: ${DURATION}s"
 
 modname="$(basename "$MODULE_PATH" .ko)"
@@ -107,7 +149,6 @@ cleanup() {
     echo "[CLEANUP] killing bg jobs..."
     pkill -P $$ 2>/dev/null || true
     sleep 0.3
-    # try to stop iperf / tcpdump if still running
     pkill -f "iperf3 -s" 2>/dev/null || true
     pkill -f "tcpdump -i" 2>/dev/null || true
     sleep 0.2
@@ -115,7 +156,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# unload module if already loaded (safer to reinsert with params)
 if lsmod | awk '{print $1}' | grep -q "^${modname}$"; then
     echo "[INFO] module $modname already loaded -> trying to rmmod (best-effort)"
     if ! rmmod "$modname" 2>/dev/null; then
@@ -125,7 +165,6 @@ if lsmod | awk '{print $1}' | grep -q "^${modname}$"; then
     fi
 fi
 
-# insert module with params so per-end values are set at init
 echo "[INFO] inserting module with params rate=${RATE_KBPS}kbps delay=${DELAY_MS}ms jitter=${JITTER_MS}ms"
 if ! insmod "$MODULE_PATH" param_rate_kbps="$RATE_KBPS" param_delay_ms="$DELAY_MS" param_jitter_ms="$JITTER_MS"; then
     echo "[ERROR] insmod failed"; exit 1
@@ -133,7 +172,6 @@ fi
 
 sleep 0.5
 
-# wait for device pair (in root namespace initially)
 WAIT=8
 DEV_A=""
 DEV_B=""
@@ -148,7 +186,6 @@ while (( WAIT-- > 0 )); do
     sleep 1
 done
 
-# If not in root, check common ns names
 if [[ -z "$DEV_A" || -z "$DEV_B" ]]; then
     if ip netns list 2>/dev/null | grep -q '^ns1_vshape'; then
         echo "[INFO] checking in netns ns1_vshape/ns2_vshape"
@@ -161,112 +198,125 @@ if [[ -z "$DEV_A" || -z "$DEV_B" ]]; then
     fi
 fi
 
-# If still not found: try to wait a little longer
 if [[ -z "$DEV_A" || -z "$DEV_B" ]]; then
     echo "[ERROR] cannot find vshape pair (vshapeA* and vshapeB*). Check dmesg. Exiting."
     dmesg | tail -n 40 | sed -n '1,200p'
     exit 1
 fi
 
-# If devices are in root, move them to netns ns1/ns2 (we create them)
-if [[ "${ROOT_MODE:-0}" -eq 1 ]]; then
-    NS1="ns1_vshape"
-    NS2="ns2_vshape"
-    echo "[INFO] creating netns $NS1 $NS2 (if missing) and moving devices"
-    ip netns add "$NS1" 2>/dev/null || true
-    ip netns add "$NS2" 2>/dev/null || true
+NS1="ns1_vshape"
+NS2="ns2_vshape"
 
-    echo "[INFO] moving $DEV_A -> $NS1"
-    ip link set "$DEV_A" netns "$NS1"
-    echo "[INFO] moving $DEV_B -> $NS2"
-    ip link set "$DEV_B" netns "$NS2"
+if [[ "${ROOT_MODE:-0}" -eq 1 ]]; then
+    if [[ "$USE_NETNS" -eq 1 ]]; then
+        echo "[INFO] creating netns $NS1 $NS2 (if missing) and moving devices"
+        ip netns add "$NS1" 2>/dev/null || true
+        ip netns add "$NS2" 2>/dev/null || true
+        echo "[INFO] moving $DEV_A -> $NS1"
+        ip link set "$DEV_A" netns "$NS1"
+        echo "[INFO] moving $DEV_B -> $NS2"
+        ip link set "$DEV_B" netns "$NS2"
+    else
+        echo "[INFO] keeping vshape pair in root namespace (--no-netns / --quick)"
+    fi
 else
-    NS1="ns1_vshape"
-    NS2="ns2_vshape"
+    if [[ "$USE_NETNS" -eq 0 ]]; then
+        echo "[ERROR] interfaces are inside netns but --no-netns was set. Run: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname; then reload module and retry."
+        exit 1
+    fi
+    echo "[INFO] using existing netns layout"
 fi
 
 sleep 0.2
 
-# configure devices inside namespaces
 echo "[INFO] configuring interfaces and IPs"
-# Avoid `ip addr flush`: on some setups it can leave `ip` in uninterruptible sleep (D state),
-# so `timeout` cannot kill it and the script appears hung. `ip addr replace` adds or updates.
-run_ns "$NS1" ip link set lo up
-run_ns_ignore "$NS1" ip link set dev vshapeA0 up
-run_ns "$NS1" ip addr replace 10.42.1.1/24 dev vshapeA0
+run_cfg "$NS1" ip link set lo up
+run_cfg_ignore "$NS1" ip link set dev vshapeA0 up
+run_cfg "$NS1" ip addr replace 10.42.1.1/24 dev vshapeA0
 
-run_ns "$NS2" ip link set lo up
-run_ns_ignore "$NS2" ip link set dev vshapeB0 up
-run_ns "$NS2" ip addr replace 10.42.1.2/24 dev vshapeB0
+run_cfg "$NS2" ip link set lo up
+run_cfg_ignore "$NS2" ip link set dev vshapeB0 up
+run_cfg "$NS2" ip addr replace 10.42.1.2/24 dev vshapeB0
 
-# disable offloads best-effort (minimize host acceleration)
 if command -v ethtool >/dev/null 2>&1; then
-    run_ns_ignore "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off
-    run_ns_ignore "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off
+    run_cfg_ignore "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off
+    run_cfg_ignore "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off
 fi
 
-# start background tcpdump on B (limited time via timeout if available)
 PCAP="$OUTDIR/test3.pcap"
 TCPDUMP_LOG="$OUTDIR/tcpdump.err"
 if [[ -n "$SKIP_TCPDUMP" ]]; then
-    echo "[INFO] skipping tcpdump (not installed)"
+    echo "[INFO] no tcpdump for this run"
     TCPDUMP_PID=""
 else
-    echo "[INFO] starting tcpdump in $NS2 (writing $PCAP)"
-    if command -v timeout >/dev/null 2>&1; then
-        ip netns exec "$NS2" timeout $((DURATION + 6)) tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
-        TCPDUMP_PID=$!
+    echo "[INFO] starting tcpdump (snaplen 128; lower load than -s 0)"
+    TD_SEC=$((DURATION + 8))
+    if [[ "$USE_NETNS" -eq 1 ]]; then
+        if command -v timeout >/dev/null 2>&1; then
+            ip netns exec "$NS2" timeout "$TD_SEC" tcpdump -i vshapeB0 -s 128 -w "$PCAP" -U not vlan >"$TCPDUMP_LOG" 2>&1 &
+        else
+            ip netns exec "$NS2" tcpdump -i vshapeB0 -s 128 -w "$PCAP" -U not vlan >"$TCPDUMP_LOG" 2>&1 &
+        fi
     else
-        ip netns exec "$NS2" tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
-        TCPDUMP_PID=$!
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "$TD_SEC" tcpdump -i vshapeB0 -s 128 -w "$PCAP" -U not vlan >"$TCPDUMP_LOG" 2>&1 &
+        else
+            tcpdump -i vshapeB0 -s 128 -w "$PCAP" -U not vlan >"$TCPDUMP_LOG" 2>&1 &
+        fi
     fi
+    TCPDUMP_PID=$!
     echo "[INFO] tcpdump pid=$TCPDUMP_PID"
     sleep 0.5
+    echo "[STEP] tcpdump started; continuing to iperf3"
 fi
 
-# Wrapper for iperf commands executed in namespaces.
-run_iperf_ns() {
-  local ns="$1"
-  shift
-  step_tty "[RUN] ip netns exec ${ns} $*"
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "${IP_TIMEOUT}" ip netns exec "$ns" "$@"
-  else
-    ip netns exec "$ns" "$@"
-  fi
-}
-
-# start iperf3 server inside NS2
 IPERF_SERVER_LOG="$OUTDIR/iperf_server.log"
-echo "[INFO] starting iperf3 server in $NS2"
-if command -v timeout >/dev/null 2>&1; then
-    # -1 serves one client then exits; timeout avoids indefinite hangs.
-    timeout $((DURATION + 12)) ip netns exec "$NS2" iperf3 -s -1 >"$IPERF_SERVER_LOG" 2>&1 &
+echo "[INFO] starting iperf3 server (bind 10.42.1.2)"
+if [[ "$USE_NETNS" -eq 1 ]]; then
+    if command -v timeout >/dev/null 2>&1; then
+        timeout $((DURATION + 25)) ip netns exec "$NS2" iperf3 -s -1 -B 10.42.1.2 >"$IPERF_SERVER_LOG" 2>&1 &
+    else
+        ip netns exec "$NS2" iperf3 -s -1 -B 10.42.1.2 >"$IPERF_SERVER_LOG" 2>&1 &
+    fi
 else
-    ip netns exec "$NS2" iperf3 -s -1 >"$IPERF_SERVER_LOG" 2>&1 &
+    if command -v timeout >/dev/null 2>&1; then
+        timeout $((DURATION + 25)) iperf3 -s -1 -B 10.42.1.2 >"$IPERF_SERVER_LOG" 2>&1 &
+    else
+        iperf3 -s -1 -B 10.42.1.2 >"$IPERF_SERVER_LOG" 2>&1 &
+    fi
 fi
 IPERF_SERVER_PID=$!
 sleep 0.6
 if ! kill -0 "$IPERF_SERVER_PID" 2>/dev/null; then
-    echo "[ERROR] iperf3 server failed to start in $NS2"
+    echo "[ERROR] iperf3 server failed to start"
     head -n 80 "$IPERF_SERVER_LOG" || true
     exit 1
 fi
 echo "[INFO] iperf3 server pid=$IPERF_SERVER_PID"
 
-# run iperf3 client UDP from NS1
 CLIENT_OUT="$OUTDIR/iperf_client.json"
-echo "[INFO] running iperf3 client UDP -> 10.42.1.2, bw=$CLIENT_BW, duration=${DURATION}s"
+echo "[INFO] running iperf3 client UDP -> 10.42.1.2, bind 10.42.1.1, bw=$CLIENT_BW, duration=${DURATION}s"
 set +e
-run_iperf_ns "$NS1" iperf3 -c 10.42.1.2 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+step_tty "[RUN] iperf3 client (${IPERF_WAIT}s max)"
+if [[ "$USE_NETNS" -eq 1 ]]; then
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${IPERF_WAIT}" ip netns exec "$NS1" iperf3 -c 10.42.1.2 -B 10.42.1.1 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+  else
+    ip netns exec "$NS1" iperf3 -c 10.42.1.2 -B 10.42.1.1 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+  fi
+else
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${IPERF_WAIT}" iperf3 -c 10.42.1.2 -B 10.42.1.1 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+  else
+    iperf3 -c 10.42.1.2 -B 10.42.1.1 -u -b "$CLIENT_BW" -t "$DURATION" -J > "$CLIENT_OUT" 2>&1
+  fi
+fi
 RC=$?
 set -e
 echo "[INFO] iperf3 client exited rc=$RC (saved to $CLIENT_OUT)"
 
-# give tcpdump a moment to flush if still running
 sleep 1
 
-# collect results
 echo "===== RESULTS ====="
 echo "iperf client output (grep bits_per_second):"
 grep -o '"bits_per_second":[^,]*' "$CLIENT_OUT" | head -n 5 || true
@@ -284,12 +334,14 @@ else
 fi
 
 echo "link stats (brief):"
-run_ns_ignore "$NS1" ip -s link show vshapeA0
-run_ns_ignore "$NS2" ip -s link show vshapeB0
+run_cfg_ignore "$NS1" ip -s link show vshapeA0
+run_cfg_ignore "$NS2" ip -s link show vshapeB0
 
 echo "Logs saved under $OUTDIR"
-echo "When done, you can cleanup: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname (if desired)"
+if [[ "$USE_NETNS" -eq 1 ]]; then
+  echo "Cleanup: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname"
+else
+  echo "Cleanup: sudo ip link set vshapeA0 down; sudo ip link set vshapeB0 down; sudo rmmod $modname"
+fi
 
-# final exit (trap will run cleanup)
 exit 0
-
