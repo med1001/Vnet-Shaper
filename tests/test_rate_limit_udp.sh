@@ -255,13 +255,22 @@ fi
 sleep 0.2
 
 echo "[INFO] configuring interfaces and IPs"
-run_cfg "$NS1" ip link set lo up
-run_cfg_ignore "$NS1" ip link set dev vshapeA0 up
-run_cfg "$NS1" ip addr replace 10.42.1.1/24 dev vshapeA0
-
-run_cfg "$NS2" ip link set lo up
-run_cfg_ignore "$NS2" ip link set dev vshapeB0 up
-run_cfg "$NS2" ip addr replace 10.42.1.2/24 dev vshapeB0
+# In root namespace (--quick), there is only one `lo`; a second `ip link set lo up`
+# can wedge RTNL on some systems after configuring vshapeA0.
+if [[ "$USE_NETNS" -eq 1 ]]; then
+    run_cfg "$NS1" ip link set lo up
+    run_cfg_ignore "$NS1" ip link set dev vshapeA0 up
+    run_cfg "$NS1" ip addr replace 10.42.1.1/24 dev vshapeA0
+    run_cfg "$NS2" ip link set lo up
+    run_cfg_ignore "$NS2" ip link set dev vshapeB0 up
+    run_cfg "$NS2" ip addr replace 10.42.1.2/24 dev vshapeB0
+else
+    run_cfg "$NS1" ip link set lo up
+    run_cfg_ignore "$NS1" ip link set dev vshapeA0 up
+    run_cfg "$NS1" ip addr replace 10.42.1.1/24 dev vshapeA0
+    run_cfg_ignore "$NS1" ip link set dev vshapeB0 up
+    run_cfg "$NS1" ip addr replace 10.42.1.2/24 dev vshapeB0
+fi
 
 if command -v ethtool >/dev/null 2>&1; then
     run_cfg_ignore "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off
