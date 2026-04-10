@@ -32,7 +32,7 @@
 MODULE_AUTHOR("Mohamed BEN MOUSSA");
 MODULE_DESCRIPTION("Two-ended virtual NIC with latency/jitter/loss/rate shaping");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("2.3");
+MODULE_VERSION("2.4");
 
 /* ---------- Tunables (defaults) ---------- */
 unsigned int param_delay_ms = 50;
@@ -44,6 +44,12 @@ bool         param_debug = false;
 
 bool         param_passthrough = false; /* bypass shaping (deliver immediately) */
 unsigned int param_max_queue = 100000;  /* safety cap for queued packets */
+/*
+ * Cap netif_rx calls per hrtimer fire. An unbounded loop here can run for milliseconds
+ * inside timer context and wedge guests (e.g. VirtualBox) under UDP flood + shaping.
+ * 0 = no limit (original behaviour; not recommended on low-resource VMs).
+ */
+unsigned int param_max_timer_packets = 64;
 
 module_param(param_delay_ms, uint, 0644);
 MODULE_PARM_DESC(param_delay_ms, "Base latency in milliseconds");
@@ -61,6 +67,8 @@ module_param(param_passthrough, bool, 0644);
 MODULE_PARM_DESC(param_passthrough, "Bypass shaping and deliver immediately to peer");
 module_param(param_max_queue, uint, 0644);
 MODULE_PARM_DESC(param_max_queue, "Max number of packets to queue per end");
+module_param(param_max_timer_packets, uint, 0644);
+MODULE_PARM_DESC(param_max_timer_packets, "Max packets delivered per timer tick (0=unlimited; use 32-128 on VMs)");
 
 /* ---------- Logging helpers ---------- */
 #ifdef VNET_SHAPE_DEBUG
@@ -196,52 +204,58 @@ static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
         return HRTIMER_NORESTART;
     }
 
-    while (1) {
-        struct vshape_qitem *q = NULL;
+    {
+        unsigned int budget = param_max_timer_packets;
 
-        spin_lock(&vp->queue_lock);
-        if (list_empty(&vp->tx_queue)) {
-            spin_unlock(&vp->queue_lock);
-            break;
-        }
+        while (1) {
+            struct vshape_qitem *q = NULL;
 
-        q = list_first_entry(&vp->tx_queue, struct vshape_qitem, list);
-        if (ktime_after(q->release_time, now)) {
-            spin_unlock(&vp->queue_lock);
-            break;
-        }
+            if (budget && processed >= budget)
+                break;
 
-        if (!vshape_bucket_consume(vp, q->skb->len)) {
-            spin_unlock(&vp->queue_lock);
-            break;
-        }
-
-        list_del(&q->list);
-        if (vp->queue_len)
-            vp->queue_len--;
-        spin_unlock(&vp->queue_lock);
-
-        /* deliver to peer (peer still valid as checked above) */
-        {
-            unsigned int pkt_len = q->skb->len;
-
-            q->skb->dev = peer_dev;
-            q->skb->protocol = eth_type_trans(q->skb, peer_dev);
-            netif_rx(q->skb);
-
-            /* update peer stats after len captured (skb ownership transfers on netif_rx) */
-            if (peer_dev && netdev_priv(peer_dev)) {
-                struct vshape_priv *peer_vp = vshape_priv(peer_dev);
-
-                u64_stats_update_begin(&peer_vp->stats_sync);
-                peer_vp->rx_packets++;
-                peer_vp->rx_bytes += pkt_len;
-                u64_stats_update_end(&peer_vp->stats_sync);
+            spin_lock(&vp->queue_lock);
+            if (list_empty(&vp->tx_queue)) {
+                spin_unlock(&vp->queue_lock);
+                break;
             }
-        }
 
-        kfree(q);
-        processed++;
+            q = list_first_entry(&vp->tx_queue, struct vshape_qitem, list);
+            if (ktime_after(q->release_time, now)) {
+                spin_unlock(&vp->queue_lock);
+                break;
+            }
+
+            if (!vshape_bucket_consume(vp, q->skb->len)) {
+                spin_unlock(&vp->queue_lock);
+                break;
+            }
+
+            list_del(&q->list);
+            if (vp->queue_len)
+                vp->queue_len--;
+            spin_unlock(&vp->queue_lock);
+
+            /* deliver to peer (peer still valid as checked above) */
+            {
+                unsigned int pkt_len = q->skb->len;
+
+                q->skb->dev = peer_dev;
+                q->skb->protocol = eth_type_trans(q->skb, peer_dev);
+                netif_rx(q->skb);
+
+                if (peer_dev && netdev_priv(peer_dev)) {
+                    struct vshape_priv *peer_vp = vshape_priv(peer_dev);
+
+                    u64_stats_update_begin(&peer_vp->stats_sync);
+                    peer_vp->rx_packets++;
+                    peer_vp->rx_bytes += pkt_len;
+                    u64_stats_update_end(&peer_vp->stats_sync);
+                }
+            }
+
+            kfree(q);
+            processed++;
+        }
     }
 
     if (processed)

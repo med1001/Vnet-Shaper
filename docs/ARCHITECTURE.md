@@ -121,6 +121,7 @@ So the timer is **not** strictly “every 1 ms globally”; it uses **1 ms steps
 - Otherwise, **`rate_bytes_per_ms`** is derived from kbps (kilobits per second → bytes per millisecond, with a minimum of 1 byte/ms to avoid a zero rate).
 - **`param_burst_ms`** scales **bucket capacity** (`rate_bytes_per_ms * burst_ms`). Tokens refill based on elapsed time since `last_bucket_update`, capped at capacity.
 - **Consumption** happens **at dequeue** (when delivering to the peer), not at enqueue—so delay and loss can precede bandwidth limiting in the pipeline.
+- **`param_max_timer_packets`** caps how many queued packets **`netif_rx()`** may run per timer tick (default 64). Without a cap, a UDP flood can spend milliseconds in one timer callback and stall some virtualized guests.
 
 Updates from **`vshape_update_rate_limit()`** (called when rate changes via Netlink) recalculate bucket parameters under the queue lock and reset tokens/capacity consistently for both ends.
 
@@ -138,7 +139,7 @@ Shaping queues are bypassed: after the peer-up and loss checks, the skb is passe
 
 The handler in `vshape_nl.c` assigns **module-global** `param_*` variables. Changing **rate** also calls **`vshape_update_rate_limit()`** so per-device buckets update immediately.
 
-**Not** exposed via Netlink today: `param_burst_ms`, `param_passthrough`, `param_max_queue`, `param_debug`—those remain **module parameters** only (`insmod` / `/sys/module/.../parameters/`).
+**Not** exposed via Netlink today: `param_burst_ms`, `param_passthrough`, `param_max_queue`, `param_max_timer_packets`, `param_debug`—those remain **module parameters** only (`insmod` / `/sys/module/.../parameters/`).
 
 `vshape_ctl` builds a Genl message with **one** attribute per invocation (e.g. `vshape_ctl set delay 50`).
 
@@ -163,6 +164,7 @@ The handler in `vshape_nl.c` assigns **module-global** `param_*` variables. Chan
 | `param_burst_ms` | Token bucket capacity in milliseconds of sustained rate. |
 | `param_passthrough` | If true, skip queues/timer and deliver immediately (still subject to loss check as implemented). |
 | `param_max_queue` | Maximum queued skbs per end (drops beyond this). |
+| `param_max_timer_packets` | Max **`netif_rx()`** calls per hrtimer tick (`0` = unlimited; default 64). |
 | `param_debug` | Reserved for optional verbose logging when built with `VNET_SHAPE_DEBUG`. |
 
 ---

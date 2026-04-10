@@ -90,6 +90,7 @@ sudo insmod kernel/vshape_mod.ko \
 | `param_burst_ms` | Token bucket size in **ms** of sustained rate (default 100). |
 | `param_passthrough` | `1` = bypass shaping (still applies loss logic as in code). |
 | `param_max_queue` | Max queued packets per end (safety cap). |
+| `param_max_timer_packets` | Max packets delivered per **hrtimer** tick (default **64**; use **32** on weak VMs; **0** = unlimited, old behaviour). |
 
 Current values are visible under `/sys/module/vshape_mod/parameters/` when the module is loaded.
 
