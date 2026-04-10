@@ -32,7 +32,7 @@
 MODULE_AUTHOR("Mohamed BEN MOUSSA");
 MODULE_DESCRIPTION("Two-ended virtual NIC with latency/jitter/loss/rate shaping");
 MODULE_LICENSE("GPL");
-MODULE_VERSION("2.2");
+MODULE_VERSION("2.3");
 
 /* ---------- Tunables (defaults) ---------- */
 unsigned int param_delay_ms = 50;
@@ -357,7 +357,10 @@ static int vshape_open(struct net_device *dev)
 {
     struct vshape_priv *vp = vshape_priv(dev);
     pr_info("%s: open (peer=%s)\n", dev->name, vp->peer ? vp->peer->name : "(none)");
-    netif_carrier_on(dev);
+    /*
+     * Avoid netif_carrier_on() here: it can trigger linkwatch/notifiers while RTNL
+     * is held during ndo_open and has been observed to deadlock on some setups.
+     */
     netif_start_queue(dev);
     return 0;
 }
@@ -366,7 +369,6 @@ static int vshape_stop(struct net_device *dev)
 {
     struct vshape_priv *vp = vshape_priv(dev);
     pr_info("%s: stop\n", dev->name);
-    netif_carrier_off(dev);
     netif_stop_queue(dev);
     hrtimer_cancel(&vp->tx_timer);
     return 0;

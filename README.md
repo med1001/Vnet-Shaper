@@ -159,7 +159,7 @@ sudo apt install iperf3 tcpdump
 sudo ./tests/test_rate_limit_udp.sh
 ```
 
-Optional flags: `--module`, `--bw`, `--rate`, `--time`, `--no-netns`, `--no-tcpdump`, `--quick` (see script header).
+Optional flags: `--module`, `--bw`, `--rate`, `--time`, `--no-netns`, `--no-tcpdump`, `--quick`, `--smoke` (see script header). Use **`--smoke`** if `ip link` / `ip addr` freezes the guest: it only loads the module and checks sysfs.
 
 On **VirtualBox**, `tcpdump -s 0` (full snaplen) inside netns has been reported to **freeze the guest**. Prefer **`--quick`** (no tcpdump, no netns) for a smoke test:
 

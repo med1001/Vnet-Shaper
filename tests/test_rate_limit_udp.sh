@@ -8,6 +8,7 @@
 #   --no-netns      keep vshapeA/B in root namespace (avoids flaky ip netns exec in some VMs)
 #   --no-tcpdump    skip capture (tcpdump + vbox can freeze the guest)
 #   --quick         same as --no-netns --no-tcpdump
+#   --smoke         only insmod + check /sys/class/net/vshapeA0|B0 + rmmod (no ip(8), no iperf3)
 #
 # Stuck on RTNL: IP_TIMEOUT=120; try stopping NetworkManager; ip netns del ns1_vshape ns2_vshape
 # Hang on `ip addr`: VSHAPE_STOP_NM=1 sudo ... (stops NetworkManager before loading the module)
@@ -23,6 +24,7 @@ JITTER_MS=0
 DURATION=8
 USE_NETNS=1
 NO_TCPDUMP_OPT=0
+SMOKE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -33,8 +35,9 @@ while [[ $# -gt 0 ]]; do
     --no-netns) USE_NETNS=0; shift;;
     --no-tcpdump) NO_TCPDUMP_OPT=1; shift;;
     --quick) USE_NETNS=0; NO_TCPDUMP_OPT=1; shift;;
+    --smoke) SMOKE=1; shift;;
     --help)
-      echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8] [--no-netns] [--no-tcpdump] [--quick]"
+      echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8] [--no-netns] [--no-tcpdump] [--quick] [--smoke]"
       exit 0
       ;;
     *) echo "Unknown $1"; shift;;
@@ -45,7 +48,7 @@ if (( EUID != 0 )); then
   echo "Run as root"; exit 1
 fi
 
-if ! command -v iperf3 >/dev/null 2>&1; then
+if [[ "$SMOKE" -eq 0 ]] && ! command -v iperf3 >/dev/null 2>&1; then
   echo "[ERROR] iperf3 is not installed — this test needs it for UDP throughput."
   echo "Install (Debian/Ubuntu): sudo apt install iperf3"
   exit 1
@@ -141,7 +144,7 @@ run_cfg_ignore() {
 
 echo "=== vshape TEST3 SAFE ==="
 echo "module: $MODULE_PATH"
-echo "mode: netns=$USE_NETNS tcpdump=$([[ -z "${SKIP_TCPDUMP:-}" ]] && echo on || echo off)"
+echo "mode: smoke=$SMOKE netns=$USE_NETNS tcpdump=$([[ -z "${SKIP_TCPDUMP:-}" ]] && echo on || echo off)"
 echo "requested client BW: $CLIENT_BW, module rate: ${RATE_KBPS} kbps, duration: ${DURATION}s"
 
 modname="$(basename "$MODULE_PATH" .ko)"
@@ -177,6 +180,22 @@ if ! insmod "$MODULE_PATH" param_rate_kbps="$RATE_KBPS" param_delay_ms="$DELAY_M
 fi
 
 sleep 0.5
+
+if [[ "$SMOKE" -eq 1 ]]; then
+    echo "[INFO] --smoke: checking sysfs only (no ip link / ip addr / iperf)"
+    for d in vshapeA0 vshapeB0; do
+        if [[ ! -e "/sys/class/net/$d" ]]; then
+            echo "[ERROR] missing /sys/class/net/$d"
+            rmmod "$modname" 2>/dev/null || true
+            exit 1
+        fi
+        echo "[OK] found /sys/class/net/$d"
+    done
+    dmesg | tail -n 30 | grep -i -E 'vnet_shape|vshape' || true
+    rmmod "$modname" 2>/dev/null || true
+    echo "[OK] smoke test passed; module removed"
+    exit 0
+fi
 
 WAIT=8
 DEV_A=""
