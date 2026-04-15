@@ -126,6 +126,10 @@ if ! insmod "$MODULE_PATH" param_rate_kbps="$RATE_KBPS" param_delay_ms="$DELAY_M
     echo "[ERROR] insmod failed"; exit 1
 fi
 
+# Clean stale namespaces from previous runs before device discovery.
+ip netns del ns1_vshape 2>/dev/null || true
+ip netns del ns2_vshape 2>/dev/null || true
+
 sleep 0.5
 
 # wait for device pair (in root namespace initially)
