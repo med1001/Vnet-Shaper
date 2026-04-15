@@ -133,8 +133,8 @@ WAIT=8
 DEV_A=""
 DEV_B=""
 while (( WAIT-- > 0 )); do
-    DEV_A="$(ip -o link show | awk -F': ' '{print $2}' | grep '^vshapeA' || true | head -n1)"
-    DEV_B="$(ip -o link show | awk -F': ' '{print $2}' | grep '^vshapeB' || true | head -n1)"
+    DEV_A="$(ip -o link show | awk -F': ' '{print $2}' | grep '^vshapeA' | head -n1 || true)"
+    DEV_B="$(ip -o link show | awk -F': ' '{print $2}' | grep '^vshapeB' | head -n1 || true)"
     if [[ -n "$DEV_A" && -n "$DEV_B" ]]; then
         echo "[INFO] found pair in root ns: $DEV_A <-> $DEV_B"
         ROOT_MODE=1
