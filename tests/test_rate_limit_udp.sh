@@ -189,19 +189,19 @@ sleep 0.2
 # configure devices inside namespaces
 echo "[INFO] configuring interfaces and IPs"
 run_ns "$NS1" ip link set lo up
-run_ns_ignore "$NS1" ip link set dev vshapeA0 up
-run_ns_ignore "$NS1" ip addr flush dev vshapeA0
-run_ns "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
+run_ns_ignore "$NS1" ip link set dev "$DEV_A" up
+run_ns_ignore "$NS1" ip addr flush dev "$DEV_A"
+run_ns "$NS1" ip addr add 10.42.1.1/24 dev "$DEV_A"
 
 run_ns "$NS2" ip link set lo up
-run_ns_ignore "$NS2" ip link set dev vshapeB0 up
-run_ns_ignore "$NS2" ip addr flush dev vshapeB0
-run_ns "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
+run_ns_ignore "$NS2" ip link set dev "$DEV_B" up
+run_ns_ignore "$NS2" ip addr flush dev "$DEV_B"
+run_ns "$NS2" ip addr add 10.42.1.2/24 dev "$DEV_B"
 
 # disable offloads best-effort (minimize host acceleration)
 if command -v ethtool >/dev/null 2>&1; then
-    run_ns_ignore "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off
-    run_ns_ignore "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off
+    run_ns_ignore "$NS1" ethtool -K "$DEV_A" tso off gso off gro off lro off
+    run_ns_ignore "$NS2" ethtool -K "$DEV_B" tso off gso off gro off lro off
 fi
 
 # start background tcpdump on B (limited time via timeout if available)
@@ -209,10 +209,10 @@ PCAP="$OUTDIR/test3.pcap"
 TCPDUMP_LOG="$OUTDIR/tcpdump.err"
 echo "[INFO] starting tcpdump in $NS2 (writing $PCAP)"
 if command -v timeout >/dev/null 2>&1; then
-    ip netns exec "$NS2" timeout $((DURATION + 6)) tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
+    ip netns exec "$NS2" timeout $((DURATION + 6)) tcpdump -i "$DEV_B" -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
     TCPDUMP_PID=$!
 else
-    ip netns exec "$NS2" tcpdump -i vshapeB0 -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
+    ip netns exec "$NS2" tcpdump -i "$DEV_B" -s 0 -w "$PCAP" not vlan >"$TCPDUMP_LOG" 2>&1 &
     TCPDUMP_PID=$!
 fi
 echo "[INFO] tcpdump pid=$TCPDUMP_PID"
@@ -256,8 +256,8 @@ else
 fi
 
 echo "link stats (brief):"
-run_ns_ignore "$NS1" ip -s link show vshapeA0
-run_ns_ignore "$NS2" ip -s link show vshapeB0
+run_ns_ignore "$NS1" ip -s link show "$DEV_A"
+run_ns_ignore "$NS2" ip -s link show "$DEV_B"
 
 echo "Logs saved under $OUTDIR"
 echo "When done, you can cleanup: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname (if desired)"

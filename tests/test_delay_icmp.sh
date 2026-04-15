@@ -104,16 +104,16 @@ ip link set "$DEV_B" netns "$NS2"
 echo "[INFO] configuring links"
 ip netns exec "$NS1" ip link set lo up
 ip netns exec "$NS2" ip link set lo up
-ip netns exec "$NS1" ip addr flush dev vshapeA0 2>/dev/null || true
-ip netns exec "$NS2" ip addr flush dev vshapeB0 2>/dev/null || true
-ip netns exec "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
-ip netns exec "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
-ip netns exec "$NS1" ip link set dev vshapeA0 up
-ip netns exec "$NS2" ip link set dev vshapeB0 up
+ip netns exec "$NS1" ip addr flush dev "$DEV_A" 2>/dev/null || true
+ip netns exec "$NS2" ip addr flush dev "$DEV_B" 2>/dev/null || true
+ip netns exec "$NS1" ip addr add 10.42.1.1/24 dev "$DEV_A"
+ip netns exec "$NS2" ip addr add 10.42.1.2/24 dev "$DEV_B"
+ip netns exec "$NS1" ip link set dev "$DEV_A" up
+ip netns exec "$NS2" ip link set dev "$DEV_B" up
 
 if command -v ethtool >/dev/null 2>&1; then
-  ip netns exec "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off 2>/dev/null || true
-  ip netns exec "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off 2>/dev/null || true
+  ip netns exec "$NS1" ethtool -K "$DEV_A" tso off gso off gro off lro off 2>/dev/null || true
+  ip netns exec "$NS2" ethtool -K "$DEV_B" tso off gso off gro off lro off 2>/dev/null || true
 fi
 
 EXPECTED_RTT_MS=$((DELAY_MS * 2))

@@ -56,7 +56,7 @@ echo "pass criteria: TX dropped delta >= ${MIN_TX_DROPS}"
 modname="$(basename "$MODULE_PATH" .ko)"
 NS1="ns1_vshape"
 NS2="ns2_vshape"
-IFACE_TX="vshapeA0"
+IFACE_TX=""  # resolved after device discovery
 TARGET_IP="10.42.1.2"
 
 cleanup() {
@@ -115,22 +115,23 @@ if [[ -z "$DEV_A" || -z "$DEV_B" ]]; then
 fi
 
 echo "[INFO] found pair in root ns: $DEV_A <-> $DEV_B"
+IFACE_TX="$DEV_A"
 ip link set "$DEV_A" netns "$NS1"
 ip link set "$DEV_B" netns "$NS2"
 
 echo "[INFO] configuring interfaces"
 ip netns exec "$NS1" ip link set lo up
 ip netns exec "$NS2" ip link set lo up
-ip netns exec "$NS1" ip addr flush dev vshapeA0 2>/dev/null || true
-ip netns exec "$NS2" ip addr flush dev vshapeB0 2>/dev/null || true
-ip netns exec "$NS1" ip addr add 10.42.1.1/24 dev vshapeA0
-ip netns exec "$NS2" ip addr add 10.42.1.2/24 dev vshapeB0
-ip netns exec "$NS1" ip link set dev vshapeA0 up
-ip netns exec "$NS2" ip link set dev vshapeB0 up
+ip netns exec "$NS1" ip addr flush dev "$DEV_A" 2>/dev/null || true
+ip netns exec "$NS2" ip addr flush dev "$DEV_B" 2>/dev/null || true
+ip netns exec "$NS1" ip addr add 10.42.1.1/24 dev "$DEV_A"
+ip netns exec "$NS2" ip addr add 10.42.1.2/24 dev "$DEV_B"
+ip netns exec "$NS1" ip link set dev "$DEV_A" up
+ip netns exec "$NS2" ip link set dev "$DEV_B" up
 
 if command -v ethtool >/dev/null 2>&1; then
-  ip netns exec "$NS1" ethtool -K vshapeA0 tso off gso off gro off lro off 2>/dev/null || true
-  ip netns exec "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off 2>/dev/null || true
+  ip netns exec "$NS1" ethtool -K "$DEV_A" tso off gso off gro off lro off 2>/dev/null || true
+  ip netns exec "$NS2" ethtool -K "$DEV_B" tso off gso off gro off lro off 2>/dev/null || true
 fi
 
 # Kill any leftover iperf3 from previous tests to free port.
