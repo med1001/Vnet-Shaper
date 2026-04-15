@@ -76,7 +76,13 @@ static int set_param(const char *param, uint32_t value) {
         goto out;
     }
 
-    /* optionally wait for ack (depending on libnl behaviour) */
+    // Wait for kernel ACK to confirm the command was accepted
+    err = nl_wait_for_ack(sock);
+    if (err < 0) {
+        fprintf(stderr, "Kernel rejected command: %s\n", nl_geterror(err));
+        goto out;
+    }
+
     nlmsg_free(msg);
     nl_socket_free(sock);
 
