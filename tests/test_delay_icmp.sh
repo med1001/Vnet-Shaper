@@ -12,6 +12,7 @@ LOSS_PPM=0
 RATE_KBPS=100000
 COUNT=10
 RTT_TOL_PCT=30   # Acceptable +/- around expected RTT
+MAX_LOSS_PCT=0   # No loss expected in a pure delay test
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,8 +23,9 @@ while [[ $# -gt 0 ]]; do
     --rate) RATE_KBPS="$2"; shift 2;;
     --count) COUNT="$2"; shift 2;;
     --rtt-tol) RTT_TOL_PCT="$2"; shift 2;;
+    --max-loss) MAX_LOSS_PCT="$2"; shift 2;;
     --help)
-      echo "Usage: $0 [--module path] [--delay 50] [--jitter 0] [--loss-ppm 0] [--rate 100000] [--count 10] [--rtt-tol 30]"
+      echo "Usage: $0 [--module path] [--delay 50] [--jitter 0] [--loss-ppm 0] [--rate 100000] [--count 10] [--rtt-tol 30] [--max-loss 0]"
       exit 0
       ;;
     *) echo "Unknown arg: $1"; shift;;
@@ -47,6 +49,7 @@ fi
 echo "=== vshape DELAY TEST ==="
 echo "module: $MODULE_PATH"
 echo "params: delay=${DELAY_MS}ms jitter=${JITTER_MS}ms loss=${LOSS_PPM}ppm rate=${RATE_KBPS}kbps count=${COUNT}"
+echo "pass criteria: RTT within +/-${RTT_TOL_PCT}% of expected, packet loss <= ${MAX_LOSS_PCT}%"
 
 modname="$(basename "$MODULE_PATH" .ko)"
 NS1="ns1_vshape"
@@ -151,6 +154,13 @@ fi
 LOSS_LINE="$(grep -m 1 'packet loss' "$PING_LOG" || true)"
 if [[ -n "$LOSS_LINE" ]]; then
   echo "[INFO] $LOSS_LINE"
+  LOSS_PCT="$(echo "$LOSS_LINE" | awk -F',' '{print $3}' | awk '{gsub(/%/,"",$1); print $1}')"
+  if [[ -n "$LOSS_PCT" ]]; then
+    if ! awk "BEGIN { exit !($LOSS_PCT <= $MAX_LOSS_PCT) }"; then
+      echo "[FAIL] packet loss ${LOSS_PCT}% exceeds maximum ${MAX_LOSS_PCT}%"
+      FAIL=1
+    fi
+  fi
 fi
 
 echo "Logs saved under $OUTDIR"
