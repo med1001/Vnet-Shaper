@@ -133,15 +133,16 @@ if command -v ethtool >/dev/null 2>&1; then
   ip netns exec "$NS2" ethtool -K vshapeB0 tso off gso off gro off lro off 2>/dev/null || true
 fi
 
-# Kill any leftover iperf3 from previous tests to free port 5201.
-pkill -f "iperf3 -s" 2>/dev/null || true
-sleep 0.5
+# Kill any leftover iperf3 from previous tests to free port.
+pkill -f "iperf3" 2>/dev/null || true
+sleep 1
 
-echo "[INFO] starting iperf3 server in $NS2"
+IPERF_PORT=5202
+echo "[INFO] starting iperf3 server in $NS2 on port $IPERF_PORT"
 IPERF_SERVER_LOG="$OUTDIR/iperf_server.log"
-ip netns exec "$NS2" iperf3 -s --one-off >"$IPERF_SERVER_LOG" 2>&1 &
+ip netns exec "$NS2" iperf3 -s -p "$IPERF_PORT" >"$IPERF_SERVER_LOG" 2>&1 &
 SERVER_PID=$!
-sleep 0.7
+sleep 1
 echo "[INFO] iperf3 server pid=$SERVER_PID"
 
 TX_DROP_BEFORE="$(get_tx_dropped "$NS1" "$IFACE_TX" || true)"
@@ -154,7 +155,7 @@ echo "[INFO] TX dropped before: $TX_DROP_BEFORE"
 CLIENT_OUT="$OUTDIR/iperf_client.json"
 echo "[INFO] running UDP iperf client -> ${TARGET_IP}, bw=${CLIENT_BW}, duration=${DURATION}s"
 set +e
-ip netns exec "$NS1" iperf3 -u -c "$TARGET_IP" -b "$CLIENT_BW" -t "$DURATION" -J >"$CLIENT_OUT" 2>&1
+ip netns exec "$NS1" iperf3 -u -c "$TARGET_IP" -p "$IPERF_PORT" -b "$CLIENT_BW" -t "$DURATION" -J >"$CLIENT_OUT" 2>&1
 RC=$?
 set -e
 echo "[INFO] iperf3 client rc=$RC (saved to $CLIENT_OUT)"
