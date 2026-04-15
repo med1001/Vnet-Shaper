@@ -6,6 +6,7 @@
 #include <netlink/msg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include "../kernel/netlink.h"
@@ -98,13 +99,22 @@ void usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    char *endptr;
+    unsigned long ul;
+
     if (argc != 4 || strcmp(argv[1], "set") != 0) {
         usage(argv[0]);
         return 1;
     }
 
-    const char *param = argv[2];
-    uint32_t value = (uint32_t)atoi(argv[3]);
+    errno = 0;
+    ul = strtoul(argv[3], &endptr, 10);
+    if (errno != 0 || *endptr != '\0' || endptr == argv[3] ||
+        ul > UINT32_MAX) {
+        fprintf(stderr, "Invalid value '%s': must be a non-negative 32-bit integer\n",
+                argv[3]);
+        return 1;
+    }
 
-    return set_param(param, value);
+    return set_param(argv[2], (uint32_t)ul);
 }
