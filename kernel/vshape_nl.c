@@ -26,6 +26,8 @@ static const struct nla_policy vshape_policy[VSHAPE_ATTR_MAX + 1] = {
 
 static int vshape_set_params(struct sk_buff *skb, struct genl_info *info)
 {
+    u32 val;
+
     if (!info)
         return -EINVAL;
 
@@ -35,13 +37,23 @@ static int vshape_set_params(struct sk_buff *skb, struct genl_info *info)
     if (info->attrs[VSHAPE_ATTR_JITTER_MS])
         param_jitter_ms = nla_get_u32(info->attrs[VSHAPE_ATTR_JITTER_MS]);
 
-    if (info->attrs[VSHAPE_ATTR_LOSS_PPM])
-        param_loss_ppm = nla_get_u32(info->attrs[VSHAPE_ATTR_LOSS_PPM]);
+    if (info->attrs[VSHAPE_ATTR_LOSS_PPM]) {
+        val = nla_get_u32(info->attrs[VSHAPE_ATTR_LOSS_PPM]);
+        if (val > 1000000) {
+            pr_warn("Netlink: loss_ppm %u clamped to 1000000\n", val);
+            val = 1000000;
+        }
+        param_loss_ppm = val;
+    }
 
     if (info->attrs[VSHAPE_ATTR_RATE_KBPS]) {
         param_rate_kbps = nla_get_u32(info->attrs[VSHAPE_ATTR_RATE_KBPS]);
-        vshape_update_rate_limit();  // APPLY THE RATE CHANGE IMMEDIATELY
+        vshape_update_rate_limit();
     }
+
+    if (param_jitter_ms > param_delay_ms)
+        pr_warn("Netlink: jitter_ms (%u) > delay_ms (%u); some packets will have zero effective delay\n",
+                param_jitter_ms, param_delay_ms);
 
     pr_info("Netlink: new params — delay=%u, jitter=%u, loss=%u, rate=%u\n",
             param_delay_ms, param_jitter_ms, param_loss_ppm, param_rate_kbps);
@@ -52,7 +64,7 @@ static int vshape_set_params(struct sk_buff *skb, struct genl_info *info)
 static const struct genl_ops vshape_ops[] = {
     {
         .cmd = VSHAPE_CMD_SET_PARAMS,
-        .flags = 0,
+        .flags = GENL_ADMIN_PERM,
         .policy = vshape_policy,
         .doit = vshape_set_params,
     },
