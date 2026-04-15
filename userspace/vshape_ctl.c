@@ -50,16 +50,21 @@ static int set_param(const char *param, uint32_t value) {
 
     // Add the appropriate attribute
     if (strcmp(param, "delay") == 0)
-        nla_put_u32(msg, VSHAPE_ATTR_DELAY_MS, value);
+        err = nla_put_u32(msg, VSHAPE_ATTR_DELAY_MS, value);
     else if (strcmp(param, "jitter") == 0)
-        nla_put_u32(msg, VSHAPE_ATTR_JITTER_MS, value);
+        err = nla_put_u32(msg, VSHAPE_ATTR_JITTER_MS, value);
     else if (strcmp(param, "loss") == 0)
-        nla_put_u32(msg, VSHAPE_ATTR_LOSS_PPM, value);
+        err = nla_put_u32(msg, VSHAPE_ATTR_LOSS_PPM, value);
     else if (strcmp(param, "rate") == 0)
-        nla_put_u32(msg, VSHAPE_ATTR_RATE_KBPS, value);
+        err = nla_put_u32(msg, VSHAPE_ATTR_RATE_KBPS, value);
     else {
         fprintf(stderr, "Unknown parameter: %s\n", param);
         err = -EINVAL;
+        goto out;
+    }
+    if (err < 0) {
+        fprintf(stderr, "Failed to add attribute to message: %s\n",
+                nl_geterror(err));
         goto out;
     }
 
