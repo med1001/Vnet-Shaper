@@ -222,17 +222,19 @@ static enum hrtimer_restart vshape_tx_timer_fn(struct hrtimer *timer)
         spin_unlock(&vp->queue_lock);
 
         /* deliver to peer (peer still valid as checked above) */
-        q->skb->dev = peer_dev;
-        q->skb->protocol = eth_type_trans(q->skb, peer_dev);
-        netif_rx(q->skb);
+        {
+            unsigned int pkt_len = q->skb->len;
+            q->skb->dev = peer_dev;
+            q->skb->protocol = eth_type_trans(q->skb, peer_dev);
+            netif_rx(q->skb);
 
-        /* update peer stats (rx) if peer's priv exists */
-        if (peer_dev && netdev_priv(peer_dev)) {
-            struct vshape_priv *peer_vp = vshape_priv(peer_dev);
-            u64_stats_update_begin(&peer_vp->stats_sync);
-            peer_vp->rx_packets++;
-            peer_vp->rx_bytes += q->skb->len;
-            u64_stats_update_end(&peer_vp->stats_sync);
+            if (peer_dev) {
+                struct vshape_priv *peer_vp = vshape_priv(peer_dev);
+                u64_stats_update_begin(&peer_vp->stats_sync);
+                peer_vp->rx_packets++;
+                peer_vp->rx_bytes += pkt_len;
+                u64_stats_update_end(&peer_vp->stats_sync);
+            }
         }
 
         kfree(q);
@@ -279,10 +281,11 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
     /* passthrough: immediate delivery to peer */
     if (param_passthrough) {
         struct vshape_priv *peer_vp = vshape_priv(vp->peer);
+        unsigned int pkt_len = skb->len;
 
         u64_stats_update_begin(&vp->stats_sync);
         vp->tx_packets++;
-        vp->tx_bytes += skb->len;
+        vp->tx_bytes += pkt_len;
         u64_stats_update_end(&vp->stats_sync);
 
         skb->dev = vp->peer;
@@ -292,7 +295,7 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
         if (peer_vp) {
             u64_stats_update_begin(&peer_vp->stats_sync);
             peer_vp->rx_packets++;
-            peer_vp->rx_bytes += skb->len;
+            peer_vp->rx_bytes += pkt_len;
             u64_stats_update_end(&peer_vp->stats_sync);
         }
         return NETDEV_TX_OK;
