@@ -318,8 +318,14 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
     /* compute release time */
     {
         s32 jitter = param_jitter_ms ? (s32)vshape_rand_below(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
-        ktime_t delay = ms_to_ktime(param_delay_ms + jitter);
-        ktime_t release_time = ktime_add(ktime_get(), delay);
+        s64 delay_ms = (s64)param_delay_ms + jitter;
+        ktime_t delay;
+        ktime_t release_time;
+
+        if (delay_ms < 0)
+            delay_ms = 0;
+        delay = ms_to_ktime((u64)delay_ms);
+        release_time = ktime_add(ktime_get(), delay);
         struct vshape_qitem *q = kmalloc(sizeof(*q), GFP_ATOMIC);
 
         if (!q) {
