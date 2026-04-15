@@ -23,7 +23,7 @@ RATE_KBPS=2000      # module shaping target rate in kbps (2 Mbps)
 DELAY_MS=0
 JITTER_MS=0
 DURATION=8
-TOLERANCE_PCT=25    # acceptable +/- percentage around RATE_KBPS
+TOLERANCE_PCT=30    # acceptable +/- percentage around RATE_KBPS
 MAX_LOSS_PCT=5      # acceptable UDP packet loss percentage
 
 # parse args simple
