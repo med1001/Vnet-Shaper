@@ -65,7 +65,6 @@ static const struct genl_ops vshape_ops[] = {
     {
         .cmd = VSHAPE_CMD_SET_PARAMS,
         .flags = GENL_ADMIN_PERM,
-        .policy = vshape_policy,
         .doit = vshape_set_params,
     },
 };
@@ -74,6 +73,7 @@ static struct genl_family vshape_family = {
     .name = VSHAPE_GENL_NAME,
     .version = VSHAPE_GENL_VERSION,
     .maxattr = VSHAPE_ATTR_MAX,
+    .policy = vshape_policy,
     .module = THIS_MODULE,
     .ops = vshape_ops,
     .n_ops = ARRAY_SIZE(vshape_ops),
