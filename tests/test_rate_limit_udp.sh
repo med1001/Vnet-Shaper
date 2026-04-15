@@ -14,7 +14,9 @@
 
 set -euo pipefail
 
-MODULE_PATH="./kernel/vshape_mod.ko"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+MODULE_PATH="${REPO_ROOT}/kernel/vshape_mod.ko"
 OUTDIR="/tmp/vshape_test3_safe.$(date +%s)"
 CLIENT_BW="5M"      # iperf client requested bandwidth
 RATE_KBPS=2000      # module shaping target rate in kbps (2 Mbps)
