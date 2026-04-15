@@ -21,6 +21,8 @@ RATE_KBPS=2000      # module shaping target rate in kbps (2 Mbps)
 DELAY_MS=0
 JITTER_MS=0
 DURATION=8
+TOLERANCE_PCT=25    # acceptable +/- percentage around RATE_KBPS
+MAX_LOSS_PCT=5      # acceptable UDP packet loss percentage
 
 # parse args simple
 while [[ $# -gt 0 ]]; do
@@ -29,7 +31,9 @@ while [[ $# -gt 0 ]]; do
     --bw) CLIENT_BW="$2"; shift 2;;
     --rate) RATE_KBPS="$2"; shift 2;;
     --time) DURATION="$2"; shift 2;;
-    --help) echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8]"; exit 0;;
+    --tol) TOLERANCE_PCT="$2"; shift 2;;
+    --max-loss) MAX_LOSS_PCT="$2"; shift 2;;
+    --help) echo "Usage: $0 [--module path] [--bw 5M] [--rate 2000] [--time 8] [--tol 25] [--max-loss 5]"; exit 0;;
     *) echo "Unknown $1"; shift;;
   esac
 done
@@ -88,6 +92,7 @@ run_ns_ignore() {
 echo "=== vshape TEST3 SAFE ==="
 echo "module: $MODULE_PATH"
 echo "requested client BW: $CLIENT_BW, module rate: ${RATE_KBPS} kbps, duration: ${DURATION}s"
+echo "pass criteria: throughput within +/-${TOLERANCE_PCT}% of ${RATE_KBPS} kbps, loss <= ${MAX_LOSS_PCT}%"
 
 modname="$(basename "$MODULE_PATH" .ko)"
 
@@ -251,6 +256,79 @@ run_ns_ignore "$NS2" ip -s link show vshapeB0
 echo "Logs saved under $OUTDIR"
 echo "When done, you can cleanup: sudo ip netns del $NS1; sudo ip netns del $NS2; sudo rmmod $modname (if desired)"
 
+# Evaluate pass/fail based on iperf JSON metrics.
+TARGET_BPS=$((RATE_KBPS * 1000))
+MIN_BPS=$((TARGET_BPS * (100 - TOLERANCE_PCT) / 100))
+MAX_BPS=$((TARGET_BPS * (100 + TOLERANCE_PCT) / 100))
+
+AVG_BPS=""
+LOSS_PCT=""
+if command -v jq >/dev/null 2>&1; then
+  AVG_BPS="$(jq -r '[.intervals[].sum.bits_per_second] | if length > 0 then (add/length) else empty end' "$CLIENT_OUT" 2>/dev/null || true)"
+  LOSS_PCT="$(jq -r '.end.sum.lost_percent // empty' "$CLIENT_OUT" 2>/dev/null || true)"
+elif command -v python3 >/dev/null 2>&1; then
+  AVG_BPS="$(python3 - "$CLIENT_OUT" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        d = json.load(f)
+    vals = [x.get("sum", {}).get("bits_per_second") for x in d.get("intervals", [])]
+    vals = [v for v in vals if isinstance(v, (int, float))]
+    print((sum(vals)/len(vals)) if vals else "")
+except Exception:
+    print("")
+PY
+)"
+  LOSS_PCT="$(python3 - "$CLIENT_OUT" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        d = json.load(f)
+    v = d.get("end", {}).get("sum", {}).get("lost_percent", "")
+    print(v)
+except Exception:
+    print("")
+PY
+)"
+fi
+
+echo "----- verdict -----"
+FAIL=0
+
+if [[ "$RC" -ne 0 ]]; then
+  echo "[FAIL] iperf3 client returned rc=$RC"
+  FAIL=1
+fi
+
+if [[ -z "$AVG_BPS" ]]; then
+  echo "[FAIL] could not parse average throughput from $CLIENT_OUT"
+  FAIL=1
+else
+  AVG_KBPS="$(awk "BEGIN { printf \"%.2f\", $AVG_BPS/1000 }")"
+  echo "[INFO] average throughput: ${AVG_KBPS} kbps (target ${RATE_KBPS} kbps, allowed ${MIN_BPS}-${MAX_BPS} bps)"
+  if ! awk "BEGIN { exit !($AVG_BPS >= $MIN_BPS && $AVG_BPS <= $MAX_BPS) }"; then
+    echo "[FAIL] average throughput outside allowed tolerance band"
+    FAIL=1
+  fi
+fi
+
+if [[ -n "$LOSS_PCT" ]]; then
+  echo "[INFO] UDP loss: ${LOSS_PCT}% (max ${MAX_LOSS_PCT}%)"
+  if ! awk "BEGIN { exit !($LOSS_PCT <= $MAX_LOSS_PCT) }"; then
+    echo "[FAIL] UDP loss above threshold"
+    FAIL=1
+  fi
+else
+  echo "[WARN] could not parse UDP loss percentage from $CLIENT_OUT"
+fi
+
+if [[ "$FAIL" -eq 0 ]]; then
+  echo "[PASS] test_rate_limit_udp checks passed."
+  # final exit (trap will run cleanup)
+  exit 0
+fi
+
+echo "[FAIL] test_rate_limit_udp checks failed."
 # final exit (trap will run cleanup)
-exit 0
+exit 2
 
