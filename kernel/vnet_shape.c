@@ -301,33 +301,20 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
         return NETDEV_TX_OK;
     }
 
-    /* queue capacity check */
-    spin_lock(&vp->queue_lock);
-    if (vp->queue_len >= param_max_queue) {
-        spin_unlock(&vp->queue_lock);
-        u64_stats_update_begin(&vp->stats_sync);
-        vp->tx_dropped++;
-        u64_stats_update_end(&vp->stats_sync);
-        pr_warn_ratelimited("%s: queue full (%u >= %u), dropping\n",
-                            dev->name, vp->queue_len, param_max_queue);
-        dev_kfree_skb(skb);
-        return NETDEV_TX_OK;
-    }
-    spin_unlock(&vp->queue_lock);
-
-    /* compute release time */
+    /* compute release time and allocate queue item outside the lock */
     {
         s32 jitter = param_jitter_ms ? (s32)vshape_rand_below(param_jitter_ms * 2) - (s32)param_jitter_ms : 0;
         s64 delay_ms = (s64)param_delay_ms + jitter;
         ktime_t delay;
         ktime_t release_time;
+        struct vshape_qitem *q;
 
         if (delay_ms < 0)
             delay_ms = 0;
         delay = ms_to_ktime((u64)delay_ms);
         release_time = ktime_add(ktime_get(), delay);
-        struct vshape_qitem *q = kmalloc(sizeof(*q), GFP_ATOMIC);
 
+        q = kmalloc(sizeof(*q), GFP_ATOMIC);
         if (!q) {
             u64_stats_update_begin(&vp->stats_sync);
             vp->tx_dropped++;
@@ -339,7 +326,20 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
         q->skb = skb;
         q->release_time = release_time;
 
+        /* single lock window: capacity check + enqueue (no TOCTOU gap) */
         spin_lock(&vp->queue_lock);
+        if (vp->queue_len >= param_max_queue) {
+            spin_unlock(&vp->queue_lock);
+            kfree(q);
+            u64_stats_update_begin(&vp->stats_sync);
+            vp->tx_dropped++;
+            u64_stats_update_end(&vp->stats_sync);
+            pr_warn_ratelimited("%s: queue full (%u >= %u), dropping\n",
+                                dev->name, vp->queue_len, param_max_queue);
+            dev_kfree_skb(skb);
+            return NETDEV_TX_OK;
+        }
+
         list_add_tail(&q->list, &vp->tx_queue);
         vp->queue_len++;
         u64_stats_update_begin(&vp->stats_sync);
