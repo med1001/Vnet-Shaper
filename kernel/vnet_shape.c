@@ -367,9 +367,27 @@ static int vshape_open(struct net_device *dev)
 static int vshape_stop(struct net_device *dev)
 {
     struct vshape_priv *vp = vshape_priv(dev);
+    struct vshape_qitem *q, *tmp;
+    unsigned int flushed = 0;
+
     pr_info("%s: stop\n", dev->name);
     netif_stop_queue(dev);
     hrtimer_cancel(&vp->tx_timer);
+
+    spin_lock(&vp->queue_lock);
+    list_for_each_entry_safe(q, tmp, &vp->tx_queue, list) {
+        list_del(&q->list);
+        if (vp->queue_len)
+            vp->queue_len--;
+        dev_kfree_skb(q->skb);
+        kfree(q);
+        flushed++;
+    }
+    spin_unlock(&vp->queue_lock);
+
+    if (flushed)
+        pr_info("%s: flushed %u queued packets on stop\n", dev->name, flushed);
+
     return 0;
 }
 
