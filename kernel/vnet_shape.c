@@ -326,30 +326,38 @@ static netdev_tx_t vshape_start_xmit(struct sk_buff *skb, struct net_device *dev
         q->skb = skb;
         q->release_time = release_time;
 
-        /* single lock window: capacity check + enqueue (no TOCTOU gap) */
-        spin_lock(&vp->queue_lock);
-        if (vp->queue_len >= param_max_queue) {
-            spin_unlock(&vp->queue_lock);
-            kfree(q);
+        /*
+         * Use irqsave: the hrtimer callback (vshape_tx_timer_fn) runs in
+         * hardirq context and also takes queue_lock.  Plain spin_lock()
+         * here would deadlock if the timer fires on the same CPU.
+         */
+        {
+            unsigned long flags;
+
+            spin_lock_irqsave(&vp->queue_lock, flags);
+            if (vp->queue_len >= param_max_queue) {
+                spin_unlock_irqrestore(&vp->queue_lock, flags);
+                kfree(q);
+                u64_stats_update_begin(&vp->stats_sync);
+                vp->tx_dropped++;
+                u64_stats_update_end(&vp->stats_sync);
+                pr_warn_ratelimited("%s: queue full (%u >= %u), dropping\n",
+                                    dev->name, vp->queue_len, param_max_queue);
+                dev_kfree_skb(skb);
+                return NETDEV_TX_OK;
+            }
+
+            list_add_tail(&q->list, &vp->tx_queue);
+            vp->queue_len++;
             u64_stats_update_begin(&vp->stats_sync);
-            vp->tx_dropped++;
+            vp->tx_packets++;
+            vp->tx_bytes += skb->len;
             u64_stats_update_end(&vp->stats_sync);
-            pr_warn_ratelimited("%s: queue full (%u >= %u), dropping\n",
-                                dev->name, vp->queue_len, param_max_queue);
-            dev_kfree_skb(skb);
-            return NETDEV_TX_OK;
+
+            if (!hrtimer_is_queued(&vp->tx_timer))
+                hrtimer_start(&vp->tx_timer, delay, HRTIMER_MODE_REL);
+            spin_unlock_irqrestore(&vp->queue_lock, flags);
         }
-
-        list_add_tail(&q->list, &vp->tx_queue);
-        vp->queue_len++;
-        u64_stats_update_begin(&vp->stats_sync);
-        vp->tx_packets++;
-        vp->tx_bytes += skb->len;
-        u64_stats_update_end(&vp->stats_sync);
-
-        if (!hrtimer_is_queued(&vp->tx_timer))
-            hrtimer_start(&vp->tx_timer, delay, HRTIMER_MODE_REL);
-        spin_unlock(&vp->queue_lock);
     }
 
     return NETDEV_TX_OK;
@@ -368,13 +376,14 @@ static int vshape_stop(struct net_device *dev)
 {
     struct vshape_priv *vp = vshape_priv(dev);
     struct vshape_qitem *q, *tmp;
+    unsigned long flags;
     unsigned int flushed = 0;
 
     pr_info("%s: stop\n", dev->name);
     netif_stop_queue(dev);
     hrtimer_cancel(&vp->tx_timer);
 
-    spin_lock(&vp->queue_lock);
+    spin_lock_irqsave(&vp->queue_lock, flags);
     list_for_each_entry_safe(q, tmp, &vp->tx_queue, list) {
         list_del(&q->list);
         if (vp->queue_len)
@@ -383,7 +392,7 @@ static int vshape_stop(struct net_device *dev)
         kfree(q);
         flushed++;
     }
-    spin_unlock(&vp->queue_lock);
+    spin_unlock_irqrestore(&vp->queue_lock, flags);
 
     if (flushed)
         pr_info("%s: flushed %u queued packets on stop\n", dev->name, flushed);
@@ -592,16 +601,20 @@ static void free_end(struct net_device **pdev)
     vp = vshape_priv(*pdev);
 
     hrtimer_cancel(&vp->tx_timer);
-    spin_lock(&vp->queue_lock);
-    list_for_each_entry_safe(q, tmp, &vp->tx_queue, list) {
-        list_del(&q->list);
-        if (vp->queue_len)
-            vp->queue_len--;
-        dev_kfree_skb(q->skb);
-        kfree(q);
-        freed++;
+    {
+        unsigned long flags;
+
+        spin_lock_irqsave(&vp->queue_lock, flags);
+        list_for_each_entry_safe(q, tmp, &vp->tx_queue, list) {
+            list_del(&q->list);
+            if (vp->queue_len)
+                vp->queue_len--;
+            dev_kfree_skb(q->skb);
+            kfree(q);
+            freed++;
+        }
+        spin_unlock_irqrestore(&vp->queue_lock, flags);
     }
-    spin_unlock(&vp->queue_lock);
     if (freed)
         pr_info("%s: freed %u queued skbs\n", (*pdev)->name, freed);
 
