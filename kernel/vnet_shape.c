@@ -1,12 +1,17 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  * vnet_shape.c – Two-ended virtual NIC (veth-like) that emulates latency,
  * jitter, loss & rate-limit between its ends.
  *
- * Each end is a normal Ethernet netdev. Frames TX'd on A are shaped and
- * delivered to B (and vice-versa). This makes it trivial to test in netns.
+ * Each end is a normal Ethernet netdev.  Frames TX'd on A are shaped and
+ * delivered to B (and vice-versa).  This makes it trivial to test in netns.
  *
- * Define VNET_SHAPE_DEBUG at build time to enable verbose/rate-limited debug.
+ * Copyright (C) 2025-2026 Mohamed BEN MOUSSA
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  */
 
 #define pr_fmt(fmt) "vnet_shape: " fmt

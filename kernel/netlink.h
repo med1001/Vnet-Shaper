@@ -1,4 +1,10 @@
-// kernel/netlink.h
+/* SPDX-License-Identifier: GPL-2.0-or-later OR GPL-3.0-or-later */
+/*
+ * netlink.h – Shared Generic Netlink definitions for vshape (kernel + userspace).
+ *
+ * Copyright (C) 2025-2026 Mohamed BEN MOUSSA
+ */
+
 #ifndef _VSHAPE_NETLINK_H_
 #define _VSHAPE_NETLINK_H_
 

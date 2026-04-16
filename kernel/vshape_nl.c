@@ -1,3 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+/*
+ * vshape_nl.c – Generic Netlink interface for runtime parameter updates.
+ *
+ * Copyright (C) 2025-2026 Mohamed BEN MOUSSA
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ */
+
 #include <linux/module.h>
 #include <net/genetlink.h>
 #include "netlink.h"

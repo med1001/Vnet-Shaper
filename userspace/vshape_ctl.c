@@ -1,4 +1,14 @@
-/* Simple userspace tool using libnl to set shaping parameters via Generic Netlink */
+// SPDX-License-Identifier: GPL-3.0-or-later
+/*
+ * vshape_ctl.c – Userspace CLI for setting vshape parameters via Generic Netlink.
+ *
+ * Copyright (C) 2025-2026 Mohamed BEN MOUSSA
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ */
 
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
